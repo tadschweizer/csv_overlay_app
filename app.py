@@ -1,13 +1,13 @@
 
 # -*- coding: utf-8 -*-
 """
-CSV Overlay Plotter (v3.3)
-- SF: robust pause detection + same-trace baselines (from v3.2)
-- DUR: 
-    * First/Last summary uses max magnitude (|y|)
-    * Per-cycle table uses max magnitude (|y|)
-    * Per-cycle plot uses peak force (max positive y). If no positive values in a cycle, plot NaN.
-- Fix: remove any y.idxmax/index usage to avoid numpy.float64 errors.
+CSV Overlay Plotter (v3.4.1)
+- Overlay plot: unchanged (no forced y=0).
+- DUR per-cycle Peak Force plot: y-axis starts at 0.
+- Keeps:
+  * SF robust pause detection + same-trace baselines
+  * DUR first/last & per-cycle table use max |force|; per-cycle plot uses positive-only peak force
+  * No idxmax/index usage
 """
 
 import streamlit as st
@@ -208,30 +208,25 @@ def analyze_sf_run_corrected(x, y, file_name):
     return out
 
 # -----------------------------
-# DUR utilities
+# DUR utilities (v3.3 behavior)
 # -----------------------------
 def _max_abs_with_pos(x, y):
-    """Return (max_abs, x_at_abs, max_pos, x_at_pos). All NaN-safe; if no positive values, max_pos is NaN."""
     arr_y = np.asarray(y, dtype=float)
     arr_x = np.asarray(x, dtype=float)
     if arr_y.size == 0 or arr_x.size == 0:
         return (np.nan, np.nan, np.nan, np.nan)
-    # max magnitude
     idx_abs = int(np.nanargmax(np.abs(arr_y)))
     max_abs = float(np.abs(arr_y[idx_abs]))
     x_at_abs = float(arr_x[idx_abs])
-    # max positive peak force
     pos_mask = arr_y > 0
     if not np.any(pos_mask):
         return (max_abs, x_at_abs, np.nan, np.nan)
-    # we want the location of the maximum positive y
     idx_pos = int(np.nanargmax(np.where(pos_mask, arr_y, -np.inf)))
     max_pos = float(arr_y[idx_pos])
     x_at_pos = float(arr_x[idx_pos])
     return (max_abs, x_at_abs, max_pos, x_at_pos)
 
 def analyze_dur_first_last(runs, file_name):
-    """First/Last summary using max magnitude (|y|)."""
     if len(runs) == 0:
         return []
     runs_sorted = sorted(runs, key=lambda t: t[0])
@@ -248,7 +243,6 @@ def analyze_dur_first_last(runs, file_name):
     }]
 
 def dur_cycle_tables(runs, file_name):
-    """Return two per-cycle tables: magnitude table and positive-peak table (for plotting)."""
     rows_mag = []
     rows_pos = []
     for cycle_label, x, y in sorted(runs, key=lambda t: t[0]):
@@ -298,7 +292,7 @@ if uploaded:
 
             base = colors[idx]; color_map[file.name] = base
 
-            # Overlay plot
+            # Overlay plot (no forced y=0)
             if len(runs) > 1:
                 for i, (cycle_label, x, y) in enumerate(runs):
                     alpha = 0.1 + 0.9 * i/(len(runs)-1) if len(runs) > 1 else 1.0
@@ -325,7 +319,10 @@ if uploaded:
         except Exception as e:
             st.error(f"Error in file {file.name}: {e}")
 
-    fig.update_layout(template="plotly_white", xaxis_title="Encoder/Motor", yaxis_title="Prox", title="Overlay Plot")
+    fig.update_layout(template="plotly_white",
+                      xaxis_title="Encoder/Motor",
+                      yaxis_title="Prox",
+                      title="Overlay Plot")
     st.plotly_chart(fig, use_container_width=True, height=900)
 
     if sf_rows_all:
@@ -370,10 +367,12 @@ if uploaded:
                                       mode="lines+markers", name=name,
                                       line=dict(color=f"rgba({r},{g},{b},1)"),
                                       marker=dict(color=f"rgba({r},{g},{b},1)")))
+        # Force y-axis to start at 0 for DUR plot only
         fig2.update_layout(template="plotly_white",
                            xaxis_title="Cycle",
                            yaxis_title="Peak Force (g)",
-                           title="Per-Cycle Peak Force (positive only)")
+                           title="Per-Cycle Peak Force (positive only)",
+                           yaxis=dict(range=[0, None], zeroline=True, zerolinewidth=1))
         st.plotly_chart(fig2, use_container_width=True, height=500)
 
         combined_pos = pd.concat([v for v in dur_cycle_pos_tables.values()], ignore_index=True)
