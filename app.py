@@ -1,11 +1,13 @@
 
 # -*- coding: utf-8 -*-
 """
-CSV Overlay Plotter (v3.2)
-- SF: robust pause detection via x-histogram + index grouping; strict same-trace baselines
-- DUR: per-cycle *peak force* = max(y) (positive-only). NaN if cycle has no positive values.
-- Per-file try/except so one bad file won't crash
-- Colors for DUR per-cycle chart match overlay
+CSV Overlay Plotter (v3.3)
+- SF: robust pause detection + same-trace baselines (from v3.2)
+- DUR: 
+    * First/Last summary uses max magnitude (|y|)
+    * Per-cycle table uses max magnitude (|y|)
+    * Per-cycle plot uses peak force (max positive y). If no positive values in a cycle, plot NaN.
+- Fix: remove any y.idxmax/index usage to avoid numpy.float64 errors.
 """
 
 import streamlit as st
@@ -81,12 +83,11 @@ def extract_runs_from_df(df):
         return [(1, xv, yv)] if len(xv) >= 5 else []
 
 # -----------------------------
-# SF pause detection (histogram + index grouping)
+# SF pause detection (from v3.2)
 # -----------------------------
-def _dense_x_centers(x, bin_width=0.05, topk=4):
+def _dense_x_centers(x, bin_width=0.05, topk=6):
     x = np.asarray(x, dtype=float)
-    if x.size < 20:
-        return []
+    if x.size < 20: return []
     xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
     if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
         return []
@@ -96,91 +97,54 @@ def _dense_x_centers(x, bin_width=0.05, topk=4):
     centers = (edges[:-1] + edges[1:]) / 2.0
     idx = np.argsort(counts)[::-1][:topk]
     candidates = sorted(centers[idx])
-    # merge centers closer than 0.3 cm
     merged = []
     for c in candidates:
         if not merged or abs(c - merged[-1]) > 0.3:
             merged.append(c)
     return merged
 
-def _indices_near(x, center, tol=0.2):
+def _indices_near(x, center, tol=0.25):
     x = np.asarray(x, dtype=float)
     mask = np.abs(x - center) <= tol
     return np.where(mask)[0]
 
 def _split_by_gaps(idxs, min_gap=100):
-    if idxs.size == 0:
-        return []
+    if idxs.size == 0: return []
     chunks = []
-    start = idxs[0]
-    prev = idxs[0]
+    start = idxs[0]; prev = idxs[0]
     for k in idxs[1:]:
         if k - prev > min_gap:
-            chunks.append((start, prev))
-            start = k
+            chunks.append((start, prev)); start = k
         prev = k
     chunks.append((start, prev))
     return chunks
 
 def detect_three_pauses(x):
-    """
-    Returns list of dicts with pause_num, idx_center, pos, direction guess (1 for adv, -1 for retract).
-    Strategy:
-      - find dense centers in x
-      - choose the smallest-x center (near ~20) and enforce TWO time-separated chunks -> Pause1 (early), Pause3 (late)
-      - choose the largest-x center (near ~35) -> Pause2 (single chunk)
-    """
     x = np.asarray(x, dtype=float)
     centers = _dense_x_centers(x, bin_width=0.05, topk=6)
-    if not centers:
-        return []
+    if not centers: return []
     xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
-    # pick near-min and near-max
-    c_min = min(centers, key=lambda c: abs(c - xmin - 0.0*(xmax-xmin)))  # just nearest to xmin
+    c_min = min(centers, key=lambda c: abs(c - xmin))
     c_max = max(centers, key=lambda c: c)
-
-    # chunks near min center
     idxs_min = _indices_near(x, c_min, tol=0.25)
     chunks_min = _split_by_gaps(idxs_min, min_gap=100)
-    # pick earliest and latest chunks for Pause1 and Pause3
-    p1 = None; p3 = None
+    p1 = p3 = None
     if len(chunks_min) >= 2:
-        s1, e1 = chunks_min[0]
-        s3, e3 = chunks_min[-1]
+        s1, e1 = chunks_min[0]; s3, e3 = chunks_min[-1]
         p1_idx = (s1 + e1)//2; p3_idx = (s3 + e3)//2
         p1 = {"pause_num": 1, "idx": int(p1_idx), "pos": float(x[p1_idx]), "dir": 1}
         p3 = {"pause_num": 3, "idx": int(p3_idx), "pos": float(x[p3_idx]), "dir": -1}
     elif len(chunks_min) == 1:
-        # only one occurrence near min-x; use it for Pause1 and synthesize Pause3 later by searching next nearest center
-        s1, e1 = chunks_min[0]
-        p1_idx = (s1 + e1)//2
+        s1, e1 = chunks_min[0]; p1_idx = (s1 + e1)//2
         p1 = {"pause_num": 1, "idx": int(p1_idx), "pos": float(x[p1_idx]), "dir": 1}
-
-    # pause 2 near max center
     idxs_max = _indices_near(x, c_max, tol=0.25)
     chunks_max = _split_by_gaps(idxs_max, min_gap=50)
     p2 = None
     if len(chunks_max) >= 1:
-        s2, e2 = chunks_max[0]
-        p2_idx = (s2 + e2)//2
+        s2, e2 = chunks_max[0]; p2_idx = (s2 + e2)//2
         p2 = {"pause_num": 2, "idx": int(p2_idx), "pos": float(x[p2_idx]), "dir": -1}
-
     pauses = [p for p in [p1, p2, p3] if p is not None]
-    # try to synthesize a third if needed: pick another center near xmin
-    if len(pauses) < 3:
-        others = [c for c in centers if abs(c - c_min) < 0.6 and abs(c - c_max) > 0.6]
-        for cc in others:
-            idxs = _indices_near(x, cc, tol=0.25)
-            chunks = _split_by_gaps(idxs, min_gap=100)
-            if len(chunks) >= 1:
-                s, e = chunks[-1]
-                idxc = (s + e)//2
-                pauses.append({"pause_num": 3, "idx": int(idxc), "pos": float(x[idxc]), "dir": -1})
-                break
-
-    # Ensure exactly three ordered by index
     pauses = sorted(pauses, key=lambda d: d["idx"])[:3]
-    # Reassign pause_num by order to match 1,2,3 semantics
     for i, p in enumerate(pauses, 1):
         p["pause_num"] = i
         if i == 1: p["dir"] = 1
@@ -244,43 +208,64 @@ def analyze_sf_run_corrected(x, y, file_name):
     return out
 
 # -----------------------------
-# DUR utilities (peak force = max positive y, NaN if none)
+# DUR utilities
 # -----------------------------
-def analyze_dur_runs(runs, file_name):
+def _max_abs_with_pos(x, y):
+    """Return (max_abs, x_at_abs, max_pos, x_at_pos). All NaN-safe; if no positive values, max_pos is NaN."""
+    arr_y = np.asarray(y, dtype=float)
+    arr_x = np.asarray(x, dtype=float)
+    if arr_y.size == 0 or arr_x.size == 0:
+        return (np.nan, np.nan, np.nan, np.nan)
+    # max magnitude
+    idx_abs = int(np.nanargmax(np.abs(arr_y)))
+    max_abs = float(np.abs(arr_y[idx_abs]))
+    x_at_abs = float(arr_x[idx_abs])
+    # max positive peak force
+    pos_mask = arr_y > 0
+    if not np.any(pos_mask):
+        return (max_abs, x_at_abs, np.nan, np.nan)
+    # we want the location of the maximum positive y
+    idx_pos = int(np.nanargmax(np.where(pos_mask, arr_y, -np.inf)))
+    max_pos = float(arr_y[idx_pos])
+    x_at_pos = float(arr_x[idx_pos])
+    return (max_abs, x_at_abs, max_pos, x_at_pos)
+
+def analyze_dur_first_last(runs, file_name):
+    """First/Last summary using max magnitude (|y|)."""
     if len(runs) == 0:
         return []
-    sorted_runs = sorted(runs, key=lambda t: t[0])
-    first = sorted_runs[0]; last = sorted_runs[-1]
-    _, x1, y1 = first; _, xL, yL = last
-    def peak_pos(x, y):
-        yv = y[y > 0]
-        if len(yv) == 0:
-            return np.nan, np.nan
-        idx = int(y[y.idxmax()].index if hasattr(y, "idxmax") else np.argmax(y))
-        # for pandas Series y, above line not ideal; simpler:
-        idx = int(np.nanargmax(np.array(y)))
-        return float(y.iloc[idx]), float(x.iloc[idx])
-    p1, x_at1 = peak_pos(x1, y1); pL, x_atL = peak_pos(xL, yL)
+    runs_sorted = sorted(runs, key=lambda t: t[0])
+    _, x1, y1 = runs_sorted[0]
+    _, xL, yL = runs_sorted[-1]
+    max_abs1, x_abs1, _, _ = _max_abs_with_pos(x1, y1)
+    max_absL, x_absL, _, _ = _max_abs_with_pos(xL, yL)
     return [{
         "File": file_name,
-        "First Cycle Peak Force (g)": round(p1, 3) if np.isfinite(p1) else np.nan,
-        "First Cycle Position (cm)": round(x_at1, 3) if np.isfinite(x_at1) else np.nan,
-        "Last Cycle Peak Force (g)": round(pL, 3) if np.isfinite(pL) else np.nan,
-        "Last Cycle Position (cm)": round(x_atL, 3) if np.isfinite(x_atL) else np.nan,
+        "First Cycle Max |Force| (g)": round(max_abs1, 3) if np.isfinite(max_abs1) else np.nan,
+        "First Cycle Position (cm)": round(x_abs1, 3) if np.isfinite(x_abs1) else np.nan,
+        "Last Cycle Max |Force| (g)": round(max_absL, 3) if np.isfinite(max_absL) else np.nan,
+        "Last Cycle Position (cm)": round(x_absL, 3) if np.isfinite(x_absL) else np.nan,
     }]
 
-def dur_cycle_peak_force(runs, file_name):
-    rows = []
+def dur_cycle_tables(runs, file_name):
+    """Return two per-cycle tables: magnitude table and positive-peak table (for plotting)."""
+    rows_mag = []
+    rows_pos = []
     for cycle_label, x, y in sorted(runs, key=lambda t: t[0]):
-        yv = y[y > 0]
-        if len(y) == 0 or len(yv) == 0:
-            rows.append({"File": file_name, "Cycle": int(cycle_label),
-                         "Peak Force (g)": np.nan, "Position (cm)": np.nan})
-            continue
-        idx = int(np.nanargmax(np.array(y)))
-        rows.append({"File": file_name, "Cycle": int(cycle_label),
-                     "Peak Force (g)": float(y.iloc[idx]), "Position (cm)": float(x.iloc[idx])})
-    return pd.DataFrame(rows)
+        max_abs, x_abs, max_pos, x_pos = _max_abs_with_pos(x, y)
+        rows_mag.append({
+            "File": file_name,
+            "Cycle": int(cycle_label),
+            "Max |Force| (g)": max_abs if np.isfinite(max_abs) else np.nan,
+            "Position (cm)": x_abs if np.isfinite(x_abs) else np.nan,
+        })
+        rows_pos.append({
+            "File": file_name,
+            "Cycle": int(cycle_label),
+            "Peak Force (g)": max_pos if np.isfinite(max_pos) else np.nan,
+            "Position (cm)": x_pos if np.isfinite(x_pos) else np.nan,
+        })
+    return pd.DataFrame(rows_mag), pd.DataFrame(rows_pos)
 
 # -----------------------------
 # Streamlit App
@@ -294,8 +279,9 @@ if uploaded:
     fig = go.Figure()
 
     sf_rows_all = []
-    dur_rows_all = []
-    dur_cycle_tables = {}
+    dur_first_last_rows = []
+    dur_cycle_mag_tables = {}
+    dur_cycle_pos_tables = {}
     color_map = {}
 
     for idx, file in enumerate(uploaded):
@@ -331,8 +317,10 @@ if uploaded:
                 row = analyze_sf_run_corrected(x_sf, y_sf, file.name)
                 sf_rows_all.append(row)
             if "dur" in fname_lower:
-                dur_rows_all.extend(analyze_dur_runs(runs, file.name))
-                dur_cycle_tables[file.name] = dur_cycle_peak_force(runs, file.name)
+                dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
+                df_mag, df_pos = dur_cycle_tables(runs, file.name)
+                dur_cycle_mag_tables[file.name] = df_mag
+                dur_cycle_pos_tables[file.name] = df_pos
 
         except Exception as e:
             st.error(f"Error in file {file.name}: {e}")
@@ -349,22 +337,32 @@ if uploaded:
                            file_name="sf_static_friction_summary.csv",
                            mime="text/csv")
 
-    if dur_rows_all:
-        st.subheader("DUR First/Last Cycle Peak Force")
-        df_dur = pd.DataFrame(dur_rows_all)
+    if dur_first_last_rows:
+        st.subheader("DUR First/Last Cycle (Max |Force|)")
+        df_dur = pd.DataFrame(dur_first_last_rows)
         st.dataframe(df_dur, use_container_width=True)
-        st.download_button("Download DUR summary (CSV)",
+        st.download_button("Download DUR first/last summary (CSV)",
                            data=df_dur.to_csv(index=False).encode("utf-8"),
-                           file_name="dur_first_last_peak_force.csv",
+                           file_name="dur_first_last_max_magnitude.csv",
                            mime="text/csv")
 
-    if dur_cycle_tables:
-        st.subheader("DUR Per-Cycle Peak Force (positive only)")
-        all_files = list(dur_cycle_tables.keys())
+    if dur_cycle_mag_tables:
+        st.subheader("DUR Per-Cycle Tables")
+        combined_mag = pd.concat([v for v in dur_cycle_mag_tables.values()], ignore_index=True)
+        st.markdown("**Per-cycle Max |Force| (table)**")
+        st.dataframe(combined_mag, use_container_width=True)
+        st.download_button("Download per-cycle Max |Force| (CSV)",
+                           data=combined_mag.to_csv(index=False).encode("utf-8"),
+                           file_name="dur_per_cycle_max_magnitude.csv",
+                           mime="text/csv")
+
+    if dur_cycle_pos_tables:
+        st.subheader("DUR Per-Cycle Peak Force Plot (positive only)")
+        all_files = list(dur_cycle_pos_tables.keys())
         selected = st.multiselect("Select DUR files to compare", all_files, default=all_files)
         fig2 = go.Figure()
         for name in selected:
-            dfc = dur_cycle_tables[name].copy()
+            dfc = dur_cycle_pos_tables[name].copy()
             dfc['Cycle'] = pd.to_numeric(dfc['Cycle'], errors='coerce')
             dfc = dfc.sort_values('Cycle')
             r, g, b = color_map.get(name, (50,50,50))
@@ -375,11 +373,11 @@ if uploaded:
         fig2.update_layout(template="plotly_white",
                            xaxis_title="Cycle",
                            yaxis_title="Peak Force (g)",
-                           title="Per-Cycle Peak Force")
+                           title="Per-Cycle Peak Force (positive only)")
         st.plotly_chart(fig2, use_container_width=True, height=500)
 
-        combined = pd.concat([v for v in dur_cycle_tables.values()], ignore_index=True)
-        st.download_button("Download DUR per-cycle peak force (CSV)",
-                           data=combined.to_csv(index=False).encode("utf-8"),
+        combined_pos = pd.concat([v for v in dur_cycle_pos_tables.values()], ignore_index=True)
+        st.download_button("Download per-cycle Peak Force (CSV)",
+                           data=combined_pos.to_csv(index=False).encode("utf-8"),
                            file_name="dur_per_cycle_peak_force.csv",
                            mime="text/csv")
