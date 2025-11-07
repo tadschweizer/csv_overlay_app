@@ -1,13 +1,10 @@
 
 # -*- coding: utf-8 -*-
 """
-CSV Overlay Plotter (v3)
-- Keeps original overlay plotting
-- SF: three pauses always; baseline computed on the *same trace* (index-aware)
-  * Pause 1 (advance near ~20 cm): baseline = mean of [pos-1.0,pos) + (pos,pos+1.5]
-  * Pause 2 (turnaround near ~35 cm): baseline = mean of [pos-1.0,pos] AFTER the spike only
-  * Pause 3 (retract near ~20 cm): baseline = mean of [pos-1.0,pos) + (pos,pos+1.5] on retract trace
-- DUR: first/last table + per-cycle maxima chart with colors matching overlay
+CSV Overlay Plotter (v3.1 hardened)
+- Same features as v3
+- Extra guards to avoid ValueError in np.gradient on short/empty inputs
+- Per-file try/except so one malformed CSV won't crash the app
 """
 
 import streamlit as st
@@ -34,7 +31,6 @@ def generate_n_colors(n):
 # CSV parsing
 # -----------------------------
 def read_csv_with_flexible_header(file_like):
-    """Find the header row containing 'prox' and ('encoder' or 'motor') then read CSV from there."""
     text = file_like.read()
     if isinstance(text, bytes):
         text = text.decode("utf-8-sig", errors="ignore")
@@ -46,7 +42,6 @@ def read_csv_with_flexible_header(file_like):
             header_index = i
             break
     if header_index is None:
-        st.error("No header row found (need a row with 'prox' and 'encoder' or 'motor').")
         return None
     csv_data = "\n".join(lines[header_index:])
     df = pd.read_csv(StringIO(csv_data), engine='python', on_bad_lines='skip')
@@ -54,7 +49,6 @@ def read_csv_with_flexible_header(file_like):
     return df
 
 def extract_runs_from_df(df):
-    """Return list of runs as (cycle_label, x_series, y_series). Uses 'Cycle' column if present."""
     encoder = [c for c in df.columns if 'encoder' in c.lower()]
     motor = [c for c in df.columns if 'motor' in c.lower()]
     x_col = encoder[0] if encoder else (motor[0] if motor else None)
@@ -62,31 +56,39 @@ def extract_runs_from_df(df):
     if x_col is None or not prox_col:
         return []
     prox_col = prox_col[0]
-
     cycle_cols = [c for c in df.columns if c.lower() == 'cycle']
     if cycle_cols:
         df['cycle_num'] = pd.to_numeric(df[cycle_cols[0]], errors='coerce')
         runs = []
         for cycle in sorted(df['cycle_num'].dropna().unique()):
-            sub = df[df['cycle_num'] == cycle].copy()
+            sub = df[df['cycle_num'] == cycle]
             x = pd.to_numeric(sub[x_col], errors='coerce')
             y = pd.to_numeric(sub[prox_col], errors='coerce')
             valid = ~(x.isna() | y.isna())
-            if valid.any():
-                runs.append((int(cycle), x[valid].reset_index(drop=True), y[valid].reset_index(drop=True)))
+            xv = x[valid].reset_index(drop=True)
+            yv = y[valid].reset_index(drop=True)
+            if len(xv) >= 2:
+                runs.append((int(cycle), xv, yv))
         return runs
     else:
         x = pd.to_numeric(df[x_col], errors='coerce')
         y = pd.to_numeric(df[prox_col], errors='coerce')
         valid = ~(x.isna() | y.isna())
-        return [(1, x[valid].reset_index(drop=True), y[valid].reset_index(drop=True))]
+        xv = x[valid].reset_index(drop=True)
+        yv = y[valid].reset_index(drop=True)
+        return [(1, xv, yv)] if len(xv) >= 2 else []
 
 # -----------------------------
-# SF pause detection (index-aware to split ~20cm into two pauses)
+# SF detection (hardened)
 # -----------------------------
-def _find_pause_groups(x, window_cm=0.25):
+def _find_pause_groups(x):
     x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 5:
+        return []
     dx = np.gradient(x)
+    if dx.size < 5:
+        return []
     dwell = np.abs(dx) < np.percentile(np.abs(dx), 20)
     groups = []
     i = 0; n = len(x)
@@ -111,7 +113,10 @@ def _find_pause_groups(x, window_cm=0.25):
     return merged
 
 def _pause_events_three(x, y):
-    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size < 5 or y.size < 5:
+        return []
     groups = _find_pause_groups(x)
     if not groups:
         return []
@@ -121,7 +126,11 @@ def _pause_events_three(x, y):
         pos = float(np.nanmedian(x[i0:i1+1]))
         j1 = min(len(x)-2, i1 + 5)
         j0 = max(1, i1 + 1)
-        dir_after = np.nanmean(np.gradient(x[j0:j1+1]))
+        seg = x[j0:j1+1]
+        if seg.size < 2:
+            dir_after = 0.0
+        else:
+            dir_after = np.nanmean(np.gradient(seg))
         events.append({"idx": int(c), "pos": pos, "dir_after": dir_after})
     events_sorted = sorted(events, key=lambda e: e["idx"])
     cleaned = []
@@ -144,6 +153,8 @@ def _pause_events_three(x, y):
 
 def _peak_in_window(x, y, pos, idx_center, direction, half_cm=0.5):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if x.size == 0 or y.size == 0:
+        return np.nan
     mask = (x >= pos - half_cm) & (x <= pos + half_cm)
     if not np.any(mask):
         return np.nan
@@ -152,6 +163,8 @@ def _peak_in_window(x, y, pos, idx_center, direction, half_cm=0.5):
 
 def _baseline_same_trace(x, y, pause_num, pos, idx_center):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if x.size == 0 or y.size == 0:
+        return np.nan
     idx = np.arange(len(x))
     if pause_num in (1,3):
         before = (idx < idx_center) & (x >= pos - 1.0) & (x < pos)
@@ -165,22 +178,24 @@ def _baseline_same_trace(x, y, pause_num, pos, idx_center):
     return float(np.nanmean(sample))
 
 def analyze_sf_run_corrected(x, y, file_name):
-    events = _pause_events_three(x, y)
-    events = sorted(events, key=lambda e: e["idx"])[:3]
-    for e in events:
-        e["direction"] = 1 if e["pause_num"] == 1 else -1
     out = {
         "File": file_name,
         "Pause1 Peak (g)": np.nan, "Pause1 Baseline (g)": np.nan, "Pause1 %Inc": np.nan,
         "Pause2 Peak (g)": np.nan, "Pause2 Baseline (g)": np.nan, "Pause2 %Inc": np.nan,
         "Pause3 Peak (g)": np.nan, "Pause3 Baseline (g)": np.nan, "Pause3 %Inc": np.nan,
     }
+    if len(x) < 5 or len(y) < 5:
+        return out
+    events = _pause_events_three(x, y)
+    if not events:
+        return out
+    events = sorted(events, key=lambda e: e["idx"])[:3]
     for e in events:
+        e["direction"] = 1 if e["pause_num"] == 1 else -1
         peak = _peak_in_window(x, y, e["pos"], e["idx"], e["direction"], half_cm=0.5)
         base = _baseline_same_trace(x, y, e["pause_num"], e["pos"], e["idx"])
-        if not np.isfinite(base) or abs(base) < 1e-9 or not np.isfinite(peak):
-            pct = np.nan
-        else:
+        pct = np.nan
+        if np.isfinite(base) and abs(base) >= 1e-9 and np.isfinite(peak):
             pct = (abs(peak) - abs(base)) / abs(base) * 100.0
         if e["pause_num"] == 1:
             out["Pause1 Peak (g)"] = round(float(peak), 3) if np.isfinite(peak) else np.nan
@@ -203,8 +218,7 @@ def analyze_dur_runs(runs, file_name):
     if len(runs) == 0:
         return []
     sorted_runs = sorted(runs, key=lambda t: t[0])
-    first = sorted_runs[0]
-    last  = sorted_runs[-1]
+    first = sorted_runs[0]; last = sorted_runs[-1]
     _, x1, y1 = first; _, xL, yL = last
     def peak_abs(x, y):
         if len(y) == 0: return np.nan, np.nan
@@ -236,9 +250,8 @@ def dur_cycle_maxima(runs, file_name):
 # -----------------------------
 # Streamlit App
 # -----------------------------
-st.set_page_config(page_title="CSV Overlay Plotter", layout="wide", initial_sidebar_state="auto")
+st.set_page_config(page_title="CSV Overlay Plotter", layout="wide")
 st.title("CSV Overlay Plotter")
-st.write("Upload one or more CSV files to see overlaid prox vs encoder/motor plots.")
 uploaded = st.file_uploader("Select CSV files", type="csv", accept_multiple_files=True)
 
 if uploaded:
@@ -251,41 +264,46 @@ if uploaded:
     color_map = {}
 
     for idx, file in enumerate(uploaded):
-        df = read_csv_with_flexible_header(StringIO(file.getvalue().decode("utf-8-sig")))
-        if df is None or df.empty:
-            continue
-        runs = extract_runs_from_df(df)
-        base = colors[idx]; color_map[file.name] = base
+        try:
+            df = read_csv_with_flexible_header(StringIO(file.getvalue().decode("utf-8-sig")))
+            if df is None or df.empty:
+                st.warning(f"Skipped {file.name}: could not find expected header.")
+                continue
 
-        if len(runs) > 1:
-            for i, (cycle_label, x, y) in enumerate(runs):
-                alpha = 0.1 + 0.9 * i/(len(runs)-1) if len(runs) > 1 else 1.0
-                rgba = f"rgba({base[0]},{base[1]},{base[2]},{alpha})"
-                show = (i == len(runs)-1); name = file.name if show else None
-                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba),
-                                         name=name, showlegend=show, legendgroup=file.name))
-        else:
-            _, x, y = runs[0]
-            rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
-            fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba), name=file.name))
+            runs = extract_runs_from_df(df)
+            if not runs:
+                st.warning(f"Skipped {file.name}: no valid numeric rows.")
+                continue
 
-        fname_lower = file.name.lower()
-        if "sf" in fname_lower:
-            _, x_sf, y_sf = runs[-1]
-            row = analyze_sf_run_corrected(x_sf, y_sf, file.name)
-            sf_rows_all.append(row)
-        if "dur" in fname_lower:
-            dur_rows_all.extend(analyze_dur_runs(runs, file.name))
-            dur_cycle_tables[file.name] = dur_cycle_maxima(runs, file.name)
+            base = colors[idx]; color_map[file.name] = base
 
-    # Overlay plot
-    fig.update_layout(template="plotly_white",
-                      xaxis_title="Encoder/Motor",
-                      yaxis_title="Prox",
-                      title="Overlay Plot")
+            if len(runs) > 1:
+                for i, (cycle_label, x, y) in enumerate(runs):
+                    alpha = 0.1 + 0.9 * i/(len(runs)-1) if len(runs) > 1 else 1.0
+                    rgba = f"rgba({base[0]},{base[1]},{base[2]},{alpha})"
+                    show = (i == len(runs)-1); name = file.name if show else None
+                    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba),
+                                             name=name, showlegend=show, legendgroup=file.name))
+            else:
+                _, x, y = runs[0]
+                rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
+                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba), name=file.name))
+
+            fname_lower = file.name.lower()
+            if "sf" in fname_lower:
+                _, x_sf, y_sf = runs[-1]
+                row = analyze_sf_run_corrected(x_sf, y_sf, file.name)
+                sf_rows_all.append(row)
+            if "dur" in fname_lower:
+                dur_rows_all.extend(analyze_dur_runs(runs, file.name))
+                dur_cycle_tables[file.name] = dur_cycle_maxima(runs, file.name)
+
+        except Exception as e:
+            st.error(f"Error in file {file.name}: {e}")
+
+    fig.update_layout(template="plotly_white", xaxis_title="Encoder/Motor", yaxis_title="Prox", title="Overlay Plot")
     st.plotly_chart(fig, use_container_width=True, height=900)
 
-    # SF table
     if sf_rows_all:
         st.subheader("SF Static-Friction Summary")
         df_sf = pd.DataFrame(sf_rows_all)
@@ -295,7 +313,6 @@ if uploaded:
                            file_name="sf_static_friction_summary.csv",
                            mime="text/csv")
 
-    # DUR first/last
     if dur_rows_all:
         st.subheader("DUR First/Last Cycle Peak Magnitudes")
         df_dur = pd.DataFrame(dur_rows_all)
@@ -305,7 +322,6 @@ if uploaded:
                            file_name="dur_cycle_peaks_summary.csv",
                            mime="text/csv")
 
-    # DUR per-cycle chart colored to overlay
     if dur_cycle_tables:
         st.subheader("DUR Per-Cycle Max Magnitude")
         all_files = list(dur_cycle_tables.keys())
