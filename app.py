@@ -268,22 +268,66 @@ essential_sf_cols = [
 ]
 
 def analyze_sf_precise(x, y, file_name):
+    """
+    Precise SF analysis:
+    - Pre value at EXACT Xp ± 0.100 cm (snapped) on the correct approach pass (rows BEFORE the pause).
+    - Post peak = extreme within 1.0 cm AFTER the pause in motion direction.
+    - Turnaround (#2): also sample Xp - 1.000 cm AFTER and report Δ.
+    """
+
+    def _approach_dir_robust_local(x_arr, idx_center, pos, lookback=400, margin=0.2):
+        """
+        Robust approach direction:
+        - Look back 'lookback' samples.
+        - Ignore points within 'margin' cm of the dwell X (de-jitter).
+        - If far-median(x) > pos → approached from high x → direction = -1 (pullback).
+          Else from low x → +1 (advance).
+        """
+        x_arr = np.asarray(x_arr, dtype=float)
+        i0 = max(0, idx_center - lookback)
+        seg = x_arr[i0:idx_center]
+        seg = seg[np.isfinite(seg)]
+        if seg.size == 0:
+            return 1
+        seg_far = seg[np.abs(seg - pos) >= margin]
+        if seg_far.size == 0:
+            seg_far = seg
+        med = np.nanmedian(seg_far)
+        return -1 if med > pos else 1
+
     rows = []
     events = detect_pauses_three_strict(x)
-    for e in events:
-        appr = _approach_dir(x, e["idx"])           # advance vs pullback approach
-        pre_off = -0.1 if appr >= 0 else +0.1        # 19.900 on advance; 20.100 on pullback (snapped)
-        pre_val, pre_x_used, _ = _value_at_exact_offset(x, y, e["pos"], e["idx"], pre_off, side="before")
 
+    for e in events:
+        # robust approach direction
+        appr = _approach_dir_robust_local(x, e["idx"], e["pos"])
+
+        # harden Pause #3 to pullback (ensures pre sample at Xp + 0.100)
+        if e.get("pause_num") == 3:
+            appr = -1
+
+        # Pre sample: BEFORE the pause, at Xp ± 0.100 depending on approach
+        pre_off = -0.1 if appr >= 0 else +0.1    # advance → 19.900 ; pullback → 20.100 (for Xp≈20)
+        pre_val, pre_x_used, _ = _value_at_exact_offset(
+            x, y, e["pos"], e["idx"], pre_off, side="before"
+        )
+
+        # Post peak within 1 cm in motion direction
         peak = _peak_after_pause_1cm(x, y, e["pos"], e["idx"], e["dir"], win_cm=1.0)
 
+        # % change vs pre (magnitude-based)
         pct = np.nan
         if np.isfinite(pre_val) and abs(pre_val) >= 1e-12 and np.isfinite(peak):
             pct = (abs(peak) - abs(pre_val)) / abs(pre_val) * 100.0
 
-        post1_val = np.nan; post1_x_used = np.nan; delta = np.nan
-        if e["pause_num"] == 2:                      # turnaround special
-            post1_val, post1_x_used, _ = _value_at_exact_offset(x, y, e["pos"], e["idx"], -1.0, side="after")
+        # Turnaround (#2): sample at Xp - 1.000 AFTER the pause and Δ
+        post1_val = np.nan
+        post1_x_used = np.nan
+        delta = np.nan
+        if e["pause_num"] == 2:
+            post1_val, post1_x_used, _ = _value_at_exact_offset(
+                x, y, e["pos"], e["idx"], -1.0, side="after"
+            )
             if np.isfinite(peak) and np.isfinite(post1_val):
                 delta = float(peak - post1_val)
 
@@ -301,7 +345,9 @@ def analyze_sf_precise(x, y, file_name):
             "Post @ (X-1.0) (g)": round(post1_val, 3) if np.isfinite(post1_val) else np.nan,
             "Δ Peak - Post@1cm (g)": round(delta, 3) if np.isfinite(delta) else np.nan,
         })
+
     return rows
+
 
 # -----------------------------
 # DUR utilities (unchanged)
