@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-CSV Overlay Plotter (v3.9)
+CSV Overlay Plotter (v3.9.1)
 
 SF improvements (combined):
-- Robust dwell-based pause detection: identifies low‑x (~20 cm) twice and high‑x (~35 cm) once.
+- Robust dwell-based pause detection: identifies low-x (~20 cm) twice and high-x (~35 cm) once.
 - Pre value sampled at EXACT Xp ± 0.100 cm (snapped to 3 decimals):
   • Choose the latest sample BEFORE the pause on the approach pass (tight band ±0.02 → ±0.05 → ±0.10).
   • If nothing in band, linearly interpolate on the approach side.
@@ -12,7 +12,7 @@ SF improvements (combined):
 
 DUR behavior unchanged:
 - Overlay plot (no forced y = 0).
-- Per‑cycle positive‑only peak plot with y-axis starting at 0.
+- Per-cycle positive-only peak plot with y-axis starting at 0.
 - No idxmax/index usage on user DataFrames.
 """
 
@@ -26,7 +26,6 @@ from io import StringIO
 # -----------------------------
 # Plot colors
 # -----------------------------
-
 def generate_n_colors(n):
     colors = []
     for i in range(max(n, 1)):
@@ -35,13 +34,11 @@ def generate_n_colors(n):
         value = 0.80
         r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
         colors.append((int(r * 255), int(g * 255), int(b * 255)))
-        
     return colors
 
 # -----------------------------
 # CSV parsing
 # -----------------------------
-
 def read_csv_with_flexible_header(file_like):
     text = file_like.read()
     if isinstance(text, bytes):
@@ -55,12 +52,10 @@ def read_csv_with_flexible_header(file_like):
             break
     if header_index is None:
         return None
-    csv_data = "
-".join(lines[header_index:])
+    csv_data = "\n".join(lines[header_index:])  # FIXED
     df = pd.read_csv(StringIO(csv_data), engine='python', on_bad_lines='skip')
     df.columns = df.columns.str.strip()
     return df
-
 
 def extract_runs_from_df(df):
     encoder = [c for c in df.columns if 'encoder' in c.lower()]
@@ -96,7 +91,6 @@ def extract_runs_from_df(df):
 # -----------------------------
 # Pause detection (dwell-based, position-grouped)
 # -----------------------------
-
 def _dense_x_centers(x, bin_width=0.05, topk=20):
     x = np.asarray(x, dtype=float)
     if x.size < 20:
@@ -110,7 +104,6 @@ def _dense_x_centers(x, bin_width=0.05, topk=20):
     centers = (edges[:-1] + edges[1:]) / 2.0
     idx = np.argsort(counts)[::-1][:topk]
     return centers[idx], counts[idx]
-
 
 def _pause_blocks_from_center(x, center, tol=0.25, min_gap=80):
     x = np.asarray(x, dtype=float)
@@ -129,9 +122,9 @@ def _pause_blocks_from_center(x, center, tol=0.25, min_gap=80):
     blocks.append((start, prev))
     return blocks
 
-
 def detect_pauses_three_strict(x):
-    """Return three pauses: low-x twice (~20 cm) and high-x once (~35 cm).
+    """
+    Return three pauses: low-x twice (~20 cm) and high-x once (~35 cm).
     Each pause dict has: pause_num, idx, pos, dir (post-pause motion sign).
     """
     x = np.asarray(x, dtype=float)
@@ -169,11 +162,11 @@ def detect_pauses_three_strict(x):
 
     (pA, _, blocksA), (pB, _, blocksB) = items[0], items[1]
     if pA > pB:
-        high_pos, high_blocks = pA, blocksA
-        low_pos, low_blocks = pB, blocksB
+        high_blocks = blocksA
+        low_blocks = blocksB
     else:
-        high_pos, high_blocks = pB, blocksB
-        low_pos, low_blocks = pA, blocksA
+        high_blocks = blocksB
+        low_blocks = blocksA
 
     low_blocks_sorted = sorted(low_blocks, key=lambda b: b["start"])
     high_blocks_sorted = sorted(high_blocks, key=lambda b: b["start"])
@@ -182,22 +175,23 @@ def detect_pauses_three_strict(x):
     p3b = low_blocks_sorted[-1]
     p2b = high_blocks_sorted[0]
 
-    p1 = {"pause_num": 1, "idx": (p1b["start"] + p1b["end"]) // 2, "pos": float(np.nanmedian(x[p1b["start"]:p1b["end"]+1])), "dir": 1}
-    p2 = {"pause_num": 2, "idx": (p2b["start"] + p2b["end"]) // 2, "pos": float(np.nanmedian(x[p2b["start"]:p2b["end"]+1])), "dir": -1}
-    p3 = {"pause_num": 3, "idx": (p3b["start"] + p3b["end"]) // 2, "pos": float(np.nanmedian(x[p3b["start"]:p3b["end"]+1])), "dir": -1}
+    p1 = {"pause_num": 1, "idx": (p1b["start"] + p1b["end"]) // 2,
+          "pos": float(np.nanmedian(x[p1b["start"]:p1b["end"]+1])), "dir": 1}
+    p2 = {"pause_num": 2, "idx": (p2b["start"] + p2b["end"]) // 2,
+          "pos": float(np.nanmedian(x[p2b["start"]:p2b["end"]+1])), "dir": -1}
+    p3 = {"pause_num": 3, "idx": (p3b["start"] + p3b["end"]) // 2,
+          "pos": float(np.nanmedian(x[p3b["start"]:p3b["end"]+1])), "dir": -1}
     return [p1, p2, p3]
 
 # -----------------------------
 # SF helpers (pre/post rules)
 # -----------------------------
-
 def _approach_dir(x, idx_center, lookback=40):
     i0 = max(1, idx_center - lookback)
     diffs = np.diff(np.asarray(x[i0:idx_center+1], dtype=float))
     if diffs.size == 0:
         return 1
     return 1 if np.nanmedian(diffs) >= 0 else -1
-
 
 def _nearest_in_band_index(x, band_lo, band_hi, idx_limit=None, side="before"):
     x = np.asarray(x, dtype=float)
@@ -210,7 +204,6 @@ def _nearest_in_band_index(x, band_lo, band_hi, idx_limit=None, side="before"):
         return None
     # choose latest before or earliest after relative to the pause index
     return int(cand[-1] if side == "before" else cand[0])
-
 
 def _interpolate_at_target(x, y, x_target, idx_limit=None, side="before", look=800):
     # Linear interpolation on the specified side of idx_center
@@ -240,7 +233,6 @@ def _interpolate_at_target(x, y, x_target, idx_limit=None, side="before", look=8
         prev_i = i
     return np.nan
 
-
 def _value_at_exact_offset(x, y, pos, idx_center, offset, side="before"):
     """
     Sample y at x_target = round(pos + offset, 3).
@@ -256,7 +248,6 @@ def _value_at_exact_offset(x, y, pos, idx_center, offset, side="before"):
     val = _interpolate_at_target(x, y, x_target, idx_limit=idx_center, side=side, look=800)
     return (float(val) if np.isfinite(val) else np.nan), float(x_target), None
 
-
 def _peak_after_pause_1cm(x, y, pos, idx_center, direction, win_cm=1.0):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     idx = np.arange(len(x))
@@ -270,13 +261,11 @@ def _peak_after_pause_1cm(x, y, pos, idx_center, direction, win_cm=1.0):
         vals = y[mask]
         return np.nan if vals.size == 0 else float(np.nanmin(vals))
 
-
 essential_sf_cols = [
     "File","Pause #","Pause X (cm)","Approach Dir","Post Dir",
     "Pre X used (cm)","Pre @ X±0.1 (g)","Peak ≤1cm After (g)","% Change vs Pre",
     "Post X used (cm)","Post @ (X-1.0) (g)","Δ Peak - Post@1cm (g)"
 ]
-
 
 def analyze_sf_precise(x, y, file_name):
     rows = []
@@ -317,7 +306,6 @@ def analyze_sf_precise(x, y, file_name):
 # -----------------------------
 # DUR utilities (unchanged)
 # -----------------------------
-
 def _max_abs_with_pos(x, y):
     arr_y = np.asarray(y, dtype=float)
     arr_x = np.asarray(x, dtype=float)
@@ -334,7 +322,6 @@ def _max_abs_with_pos(x, y):
     x_at_pos = float(arr_x[idx_pos])
     return (max_abs, x_at_abs, max_pos, x_at_pos)
 
-
 def analyze_dur_first_last(runs, file_name):
     if len(runs) == 0:
         return []
@@ -350,7 +337,6 @@ def analyze_dur_first_last(runs, file_name):
         "Last Cycle Max |Force| (g)": round(max_absL, 3) if np.isfinite(max_absL) else np.nan,
         "Last Cycle Position (cm)": round(x_absL, 3) if np.isfinite(x_absL) else np.nan,
     }]
-
 
 def dur_cycle_tables(runs, file_name):
     rows_mag = []
@@ -374,7 +360,6 @@ def dur_cycle_tables(runs, file_name):
 # -----------------------------
 # Streamlit App
 # -----------------------------
-
 st.set_page_config(page_title="CSV Overlay Plotter", layout="wide")
 st.title("CSV Overlay Plotter")
 uploaded = st.file_uploader("Select CSV files", type="csv", accept_multiple_files=True)
@@ -383,7 +368,7 @@ if uploaded:
     colors = generate_n_colors(len(uploaded))
     fig = go.Figure()
 
-    sf_rows_precise = []   # NEW precise SF table
+    sf_rows_precise = []
     dur_first_last_rows = []
     dur_cycle_mag_tables = {}
     dur_cycle_pos_tables = {}
@@ -413,13 +398,9 @@ if uploaded:
                     name = file.name if show else None
                     fig.add_trace(
                         go.Scatter(
-                            x=x,
-                            y=y,
-                            mode="lines",
+                            x=x, y=y, mode="lines",
                             line=dict(color=rgba),
-                            name=name,
-                            showlegend=show,
-                            legendgroup=file.name,
+                            name=name, showlegend=show, legendgroup=file.name
                         )
                     )
             else:
@@ -429,12 +410,12 @@ if uploaded:
 
             fname_lower = file.name.lower()
 
-            # --- SF processing (use last run) ---
+            # SF processing (use last run)
             if "sf" in fname_lower:
                 _, x_sf, y_sf = runs[-1]
                 sf_rows_precise.extend(analyze_sf_precise(x_sf, y_sf, file.name))
 
-            # --- DUR processing ---
+            # DUR processing
             if "dur" in fname_lower:
                 dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
                 df_mag, df_pos = dur_cycle_tables(runs, file_name=file.name)
@@ -444,7 +425,6 @@ if uploaded:
         except Exception as e:
             st.error(f"Error in file {file.name}: {e}")
 
-    # Overlay figure
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Encoder/Motor",
@@ -454,7 +434,7 @@ if uploaded:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- SF output (precise rules) ---
+    # SF output (precise rules)
     if sf_rows_precise:
         st.subheader("SF Pause → 1 cm Peak (precise rules)")
         df_sf = pd.DataFrame(sf_rows_precise)[essential_sf_cols]
@@ -466,7 +446,7 @@ if uploaded:
             mime="text/csv",
         )
 
-    # --- DUR outputs ---
+    # DUR outputs
     if dur_first_last_rows:
         st.subheader("DUR First/Last Cycle (Max |Force|)")
         df_dur = pd.DataFrame(dur_first_last_rows)
@@ -502,10 +482,8 @@ if uploaded:
             r, g, b = color_map.get(name, (50, 50, 50))
             fig2.add_trace(
                 go.Scatter(
-                    x=dfc['Cycle'],
-                    y=dfc['Peak Force (g)'],
-                    mode="lines+markers",
-                    name=name,
+                    x=dfc['Cycle'], y=dfc['Peak Force (g)'],
+                    mode="lines+markers", name=name,
                     line=dict(color=f"rgba({r},{g},{b},1)"),
                     marker=dict(color=f"rgba({r},{g},{b},1)"),
                 )
