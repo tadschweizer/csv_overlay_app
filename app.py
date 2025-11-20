@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-CSV Overlay Plotter (v3.5)
-- NEW: For SF traces, detect 3 pauses and report the peak force within 1 cm *after* each pause in the correct motion direction.
-- Baseline for % change: value immediately *before* the pause (local median in a narrow window).
-- Also reports an "Alt % Change vs Post" using the median of the 1 cm window after the pause (useful for cases like x=35 → -20 spike then -5 settle).
-- DUR plots unchanged (overlay: no forced y=0; per-cycle peak plot y starts at 0).
-- Keeps:
-  * SF robust pause detection + same-trace analysis (no cross-trace baselines)
-  * DUR first/last & per-cycle tables use max |force|; per-cycle plot uses positive-only peak force
-  * No idxmax/index usage
+CSV Overlay Plotter (v3.8)
+
+What’s new (SF only):
+- Dwell-based pause detection that finds low-x (~20 cm) twice and high-x (~35 cm) once.
+- Pre-stop value is the force at exactly Xp ± 0.100 cm (snapped to 3 decimals),
+  taken from the latest sample BEFORE the pause on the correct approach pass
+  (or linear interpolation if no point is within the tight band).
+- Post-peak is the extreme within the first 1.0 cm after the pause in the motion direction
+  (max if moving +, min if moving −).
+- For the turnaround (Pause #2), also report force at Xp − 1.000 cm AFTER the pause and Δ=peak−that value.
+
+DUR behavior is unchanged:
+- Overlay plot (no forced y=0)
+- Per-cycle positive-only peak plot with y-axis starting at 0
+- No idxmax/index usage on user DataFrames
 """
 
 import streamlit as st
@@ -21,7 +27,6 @@ from io import StringIO
 # -----------------------------
 # Plot colors
 # -----------------------------
-
 def generate_n_colors(n):
     colors = []
     for i in range(max(n, 1)):
@@ -35,7 +40,6 @@ def generate_n_colors(n):
 # -----------------------------
 # CSV parsing
 # -----------------------------
-
 def read_csv_with_flexible_header(file_like):
     text = file_like.read()
     if isinstance(text, bytes):
@@ -53,7 +57,6 @@ def read_csv_with_flexible_header(file_like):
     df = pd.read_csv(StringIO(csv_data), engine='python', on_bad_lines='skip')
     df.columns = df.columns.str.strip()
     return df
-
 
 def extract_runs_from_df(df):
     encoder = [c for c in df.columns if 'encoder' in c.lower()]
@@ -87,108 +90,165 @@ def extract_runs_from_df(df):
         return [(1, xv, yv)] if len(xv) >= 5 else []
 
 # -----------------------------
-# SF pause detection
+# Pause detection (dwell-based, position-grouped)
 # -----------------------------
-
-def _dense_x_centers(x, bin_width=0.05, topk=6):
+def _dense_x_centers(x, bin_width=0.05, topk=20):
     x = np.asarray(x, dtype=float)
     if x.size < 20:
-        return []
+        return np.array([]), np.array([])
     xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
     if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
-        return []
+        return np.array([]), np.array([])
     n_bins = max(20, int(np.ceil((xmax - xmin) / bin_width)))
     edges = np.linspace(xmin, xmax, n_bins + 1)
     counts, _ = np.histogram(x, bins=edges)
     centers = (edges[:-1] + edges[1:]) / 2.0
     idx = np.argsort(counts)[::-1][:topk]
-    candidates = sorted(centers[idx])
-    merged = []
-    for c in candidates:
-        if not merged or abs(c - merged[-1]) > 0.3:
-            merged.append(c)
-    return merged
+    return centers[idx], counts[idx]
 
-
-def _indices_near(x, center, tol=0.25):
+def _pause_blocks_from_center(x, center, tol=0.25, min_gap=80):
     x = np.asarray(x, dtype=float)
     mask = np.abs(x - center) <= tol
-    return np.where(mask)[0]
-
-
-def _split_by_gaps(idxs, min_gap=100):
+    idxs = np.where(mask)[0]
     if idxs.size == 0:
         return []
-    chunks = []
+    blocks = []
     start = idxs[0]
     prev = idxs[0]
     for k in idxs[1:]:
         if k - prev > min_gap:
-            chunks.append((start, prev))
+            blocks.append((start, prev))
             start = k
         prev = k
-    chunks.append((start, prev))
-    return chunks
+    blocks.append((start, prev))
+    return blocks
 
-
-def detect_three_pauses(x):
-    """Return up to three pause dicts with fields: pause_num, idx, pos, dir(+1/-1)."""
+def detect_pauses_three_strict(x):
+    """
+    Return three pauses: low-x twice (~20 cm) and high-x once (~35 cm).
+    Each pause dict has: pause_num, idx, pos, dir (post-pause motion sign).
+    """
     x = np.asarray(x, dtype=float)
-    centers = _dense_x_centers(x, bin_width=0.05, topk=6)
-    if not centers:
+    centers, _ = _dense_x_centers(x, bin_width=0.05, topk=20)
+    if len(centers) == 0:
         return []
-    xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
-    # Treat lowest-x center as the "20 cm" stop (appears twice); highest-x as the mid "35 cm" stop.
-    c_min = min(centers, key=lambda c: abs(c - xmin))
-    c_max = max(centers, key=lambda c: c)
 
-    # Low-x stop usually happens twice (outward and return)
-    idxs_min = _indices_near(x, c_min, tol=0.25)
-    chunks_min = _split_by_gaps(idxs_min, min_gap=100)
-    p1 = p3 = None
-    if len(chunks_min) >= 2:
-        s1, e1 = chunks_min[0]
-        s3, e3 = chunks_min[-1]
-        p1_idx = (s1 + e1) // 2
-        p3_idx = (s3 + e3) // 2
-        p1 = {"pause_num": 1, "idx": int(p1_idx), "pos": float(x[p1_idx]), "dir": 1}
-        p3 = {"pause_num": 3, "idx": int(p3_idx), "pos": float(x[p3_idx]), "dir": -1}
-    elif len(chunks_min) == 1:
-        s1, e1 = chunks_min[0]
-        p1_idx = (s1 + e1) // 2
-        p1 = {"pause_num": 1, "idx": int(p1_idx), "pos": float(x[p1_idx]), "dir": 1}
+    cand_blocks = []
+    for c in centers:
+        for s, e in _pause_blocks_from_center(x, c, tol=0.25, min_gap=80):
+            xm = float(np.nanmedian(x[s:e+1]))
+            cand_blocks.append({"start": int(s), "end": int(e), "x_med": xm, "len": int(e - s + 1)})
+    if not cand_blocks:
+        return []
 
-    # High-x stop happens once and is followed by negative direction
-    idxs_max = _indices_near(x, c_max, tol=0.25)
-    chunks_max = _split_by_gaps(idxs_max, min_gap=50)
-    p2 = None
-    if len(chunks_max) >= 1:
-        s2, e2 = chunks_max[0]
-        p2_idx = (s2 + e2) // 2
-        p2 = {"pause_num": 2, "idx": int(p2_idx), "pos": float(x[p2_idx]), "dir": -1}
+    # Group by position using 0.5 cm buckets
+    groups = {}
+    for b in cand_blocks:
+        key = round(b["x_med"] * 2) / 2.0
+        groups.setdefault(key, []).append(b)
 
-    pauses = [p for p in [p1, p2, p3] if p is not None]
-    pauses = sorted(pauses, key=lambda d: d["idx"])[:3]
+    # Pick the two strongest dwell positions (expected: ~20 and ~35)
+    items = [(k, sum(bb["len"] for bb in v), v) for k, v in groups.items()]
+    items.sort(key=lambda t: t[1], reverse=True)
+    if len(items) < 2:
+        # Fallback: earliest 3 by time
+        blocks = sorted(cand_blocks, key=lambda b: b["start"])[:3]
+        evts = []
+        for i, b in enumerate(blocks, 1):
+            idxc = (b["start"] + b["end"]) // 2
+            post_slope = np.nanmedian(np.diff(x[idxc:idxc+10]))
+            dir_sign = 1 if (np.isfinite(post_slope) and post_slope >= 0) else -1
+            evts.append({"pause_num": i, "idx": idxc, "pos": b["x_med"], "dir": dir_sign})
+        return evts
 
-    # Normalize numbering/dir: first pause dir=+1, the rest dir=-1
-    for i, p in enumerate(pauses, 1):
-        p["pause_num"] = i
-        if i == 1:
-            p["dir"] = 1
-        else:
-            p["dir"] = -1
-    return pauses
+    (pA, _, blocksA), (pB, _, blocksB) = items[0], items[1]
+    if pA > pB:
+        high_pos, high_blocks = pA, blocksA
+        low_pos, low_blocks = pB, blocksB
+    else:
+        high_pos, high_blocks = pB, blocksB
+        low_pos, low_blocks = pA, blocksA
+
+    low_blocks_sorted = sorted(low_blocks, key=lambda b: b["start"])
+    high_blocks_sorted = sorted(high_blocks, key=lambda b: b["start"])
+
+    p1b = low_blocks_sorted[0]
+    p3b = low_blocks_sorted[-1]
+    p2b = high_blocks_sorted[0]
+
+    p1 = {"pause_num": 1, "idx": (p1b["start"] + p1b["end"]) // 2, "pos": float(np.nanmedian(x[p1b["start"]:p1b["end"]+1])), "dir": 1}
+    p2 = {"pause_num": 2, "idx": (p2b["start"] + p2b["end"]) // 2, "pos": float(np.nanmedian(x[p2b["start"]:p2b["end"]+1])), "dir": -1}
+    p3 = {"pause_num": 3, "idx": (p3b["start"] + p3b["end"]) // 2, "pos": float(np.nanmedian(x[p3b["start"]:p3b["end"]+1])), "dir": -1}
+    return [p1, p2, p3]
 
 # -----------------------------
-# SF peak/baseline helpers
+# SF helpers (pre/post rules)
 # -----------------------------
+def _approach_dir(x, idx_center, lookback=40):
+    i0 = max(1, idx_center - lookback)
+    diffs = np.diff(np.asarray(x[i0:idx_center+1], dtype=float))
+    if diffs.size == 0:
+        return 1
+    m = np.nanmedian(diffs)
+    return 1 if m >= 0 else -1
 
-def _peak_after_pause(x, y, pos, idx_center, direction, win_cm=1.0):
-    """Extreme value within 1 cm AFTER the pause along motion direction.
-    dir>=0 → search [pos, pos+1] and take max; dir<0 → search [pos-1, pos] and take min.
-    Only uses samples with index > idx_center (post-pause in time)."""
+def _nearest_in_band_index(x, band_lo, band_hi, idx_limit=None, side="before"):
     x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    idx = np.arange(len(x))
+    mask = np.isfinite(x) & (x >= band_lo) & (x <= band_hi)
+    if idx_limit is not None:
+        mask &= (idx < idx_limit) if side == "before" else (idx > idx_limit)
+    cand = np.where(mask)[0]
+    if cand.size == 0:
+        return None
+    # choose latest before or earliest after relative to the pause index
+    return int(cand[-1] if side == "before" else cand[0])
+
+def _interpolate_at_target(x, y, x_target, idx_limit=None, side="before", look=800):
+    # linear interpolation using the closest segment on the specified side
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if idx_limit is None:
+        return np.nan
+    if side == "before":
+        i0 = max(0, idx_limit - look); i1 = idx_limit - 1
+        rng = range(i1, i0, -1)  # backward
+    else:
+        i0 = idx_limit + 1; i1 = min(len(x) - 1, idx_limit + look)
+        rng = range(i0, i1)     # forward
+    prev_i = None
+    for i in rng:
+        if prev_i is None:
+            prev_i = i
+            continue
+        xa, xb = x[prev_i], x[i]
+        if (xa - x_target) * (xb - x_target) <= 0 and np.isfinite(xa) and np.isfinite(xb):
+            ya, yb = y[prev_i], y[i]
+            if not (np.isfinite(ya) and np.isfinite(yb)):
+                prev_i = i; continue
+            if abs(xb - xa) < 1e-12:
+                return float(ya)
+            t = (x_target - xa) / (xb - xa)
+            return float(ya + t * (yb - ya))
+        prev_i = i
+    return np.nan
+
+def _value_at_exact_offset(x, y, pos, idx_center, offset, side="before"):
+    """
+    Sample y at x_target = round(pos + offset, 3).
+    Prefer the latest sample BEFORE the pause (or earliest AFTER) in a tight band, else widen, else interpolate.
+    This avoids grabbing the other pass at the same x.
+    """
+    x_target = round(pos + offset, 3)  # e.g., 20.000 - 0.100 => 19.900
+    for tol in (0.02, 0.05, 0.10):
+        lo, hi = x_target - tol, x_target + tol
+        j = _nearest_in_band_index(x, lo, hi, idx_limit=idx_center, side=side)
+        if j is not None:
+            return float(y[j]), float(x[j]), j
+    val = _interpolate_at_target(x, y, x_target, idx_limit=idx_center, side=side, look=800)
+    return (float(val) if np.isfinite(val) else np.nan), float(x_target), None
+
+def _peak_after_pause_1cm(x, y, pos, idx_center, direction, win_cm=1.0):
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     idx = np.arange(len(x))
     mask = idx > idx_center
     if direction >= 0:
@@ -200,92 +260,45 @@ def _peak_after_pause(x, y, pos, idx_center, direction, win_cm=1.0):
         vals = y[mask]
         return np.nan if vals.size == 0 else float(np.nanmin(vals))
 
-
-def _baseline_pre_pause(x, y, pos, idx_center, w=0.2):
-    """Value just BEFORE the pause: median in a narrow window [pos-w, pos] using idx < idx_center.
-    Falls back to a wider window if needed; last sample before idx_center if still empty."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    idx = np.arange(len(x))
-    mask = (idx < idx_center) & (x >= pos - w) & (x <= pos + 1e-9)
-    vals = y[mask]
-    if vals.size == 0:
-        w2 = 0.4
-        mask = (idx < idx_center) & (x >= pos - w2) & (x <= pos + 1e-9)
-        vals = y[mask]
-    if vals.size == 0:
-        before = np.where(idx < idx_center)[0]
-        if before.size == 0:
-            return np.nan
-        j = before[-1]
-        return float(y[j])
-    return float(np.nanmedian(vals))
-
-
-def _post_window_median(x, y, pos, idx_center, direction, win_cm=1.0):
-    """Median of y *after* the pause inside the 1 cm window (robust to spikes).
-    We trim 10% on both ends to de-weight the spike itself.
-    Useful for cases where the trace quickly settles after the spike (e.g., -20 → -5)."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    idx = np.arange(len(x))
-    mask = idx > idx_center
-    if direction >= 0:
-        mask &= (x >= pos) & (x <= pos + win_cm)
-    else:
-        mask &= (x <= pos) & (x >= pos - win_cm)
-    vals = y[mask]
-    if vals.size == 0:
-        return np.nan
-    vals_sorted = np.sort(vals)
-    n = len(vals_sorted)
-    lo = int(np.floor(0.1 * n))
-    hi = int(np.ceil(0.9 * n))
-    if hi <= lo:
-        return float(np.nanmedian(vals_sorted))
-    trimmed = vals_sorted[lo:hi]
-    return float(np.nanmedian(trimmed))
-
-
-def analyze_sf_pause_peaks(x, y, file_name):
-    """Return per-pause rows with: pre-pause value, peak ≤1 cm after, and % changes."""
-    out_rows = []
-    if len(x) < 20 or len(y) < 20:
-        return out_rows
-    events = detect_three_pauses(x)
-    if not events:
-        return out_rows
-
+def analyze_sf_precise(x, y, file_name):
+    rows = []
+    events = detect_pauses_three_strict(x)
     for e in events:
-        base_pre = _baseline_pre_pause(x, y, e["pos"], e["idx"])  # just before pause
-        peak = _peak_after_pause(x, y, e["pos"], e["idx"], e["dir"], win_cm=1.0)
-        post_med = _post_window_median(x, y, e["pos"], e["idx"], e["dir"], win_cm=1.0)
+        appr = _approach_dir(x, e["idx"])         # advance vs pullback approach
+        pre_off = -0.1 if appr >= 0 else +0.1     # 19.900 on advance; 20.100 on pullback (snapped)
+        pre_val, pre_x_used, _ = _value_at_exact_offset(x, y, e["pos"], e["idx"], pre_off, side="before")
+
+        peak = _peak_after_pause_1cm(x, y, e["pos"], e["idx"], e["dir"], win_cm=1.0)
 
         pct = np.nan
-        if np.isfinite(base_pre) and abs(base_pre) >= 1e-9 and np.isfinite(peak):
-            pct = (abs(peak) - abs(base_pre)) / abs(base_pre) * 100.0
+        if np.isfinite(pre_val) and abs(pre_val) >= 1e-12 and np.isfinite(peak):
+            pct = (abs(peak) - abs(pre_val)) / abs(pre_val) * 100.0
 
-        alt_pct = np.nan
-        if np.isfinite(post_med) and abs(post_med) >= 1e-9 and np.isfinite(peak):
-            alt_pct = (abs(peak) - abs(post_med)) / abs(post_med) * 100.0
+        post1_val = np.nan; post1_x_used = np.nan; delta = np.nan
+        if e["pause_num"] == 2:                   # turnaround special
+            post1_val, post1_x_used, _ = _value_at_exact_offset(x, y, e["pos"], e["idx"], -1.0, side="after")
+            if np.isfinite(peak) and np.isfinite(post1_val):
+                delta = float(peak - post1_val)
 
-        out_rows.append({
+        rows.append({
             "File": file_name,
             "Pause #": e["pause_num"],
             "Pause X (cm)": round(float(e["pos"]), 3),
-            "Direction": "pos" if e["dir"] >= 0 else "neg",
-            "Pre-Pause Value (g)": round(float(base_pre), 3) if np.isfinite(base_pre) else np.nan,
-            "Peak ≤1cm After (g)": round(float(peak), 3) if np.isfinite(peak) else np.nan,
-            "% Change vs Pre-Pause": round(float(pct), 2) if np.isfinite(pct) else np.nan,
-            "Post-Window Median (g)": round(float(post_med), 3) if np.isfinite(post_med) else np.nan,
-            "Alt % Change vs Post": round(float(alt_pct), 2) if np.isfinite(alt_pct) else np.nan,
+            "Approach Dir": "pos" if appr >= 0 else "neg",
+            "Post Dir": "pos" if e["dir"] >= 0 else "neg",
+            "Pre X used (cm)": round(pre_x_used, 3) if np.isfinite(pre_x_used) else np.nan,
+            "Pre @ X±0.1 (g)": round(pre_val, 3) if np.isfinite(pre_val) else np.nan,
+            "Peak ≤1cm After (g)": round(peak, 3) if np.isfinite(peak) else np.nan,
+            "% Change vs Pre": round(pct, 2) if np.isfinite(pct) else np.nan,
+            "Post X used (cm)": round(post1_x_used, 3) if np.isfinite(post1_x_used) else np.nan,
+            "Post @ (X-1.0) (g)": round(post1_val, 3) if np.isfinite(post1_val) else np.nan,
+            "Δ Peak - Post@1cm (g)": round(delta, 3) if np.isfinite(delta) else np.nan,
         })
-    return out_rows
+    return rows
 
 # -----------------------------
-# Durability (DUR) utilities (v3.3 behavior)
+# DUR utilities (unchanged)
 # -----------------------------
-
 def _max_abs_with_pos(x, y):
     arr_y = np.asarray(y, dtype=float)
     arr_x = np.asarray(x, dtype=float)
@@ -302,7 +315,6 @@ def _max_abs_with_pos(x, y):
     x_at_pos = float(arr_x[idx_pos])
     return (max_abs, x_at_abs, max_pos, x_at_pos)
 
-
 def analyze_dur_first_last(runs, file_name):
     if len(runs) == 0:
         return []
@@ -318,7 +330,6 @@ def analyze_dur_first_last(runs, file_name):
         "Last Cycle Max |Force| (g)": round(max_absL, 3) if np.isfinite(max_absL) else np.nan,
         "Last Cycle Position (cm)": round(x_absL, 3) if np.isfinite(x_absL) else np.nan,
     }]
-
 
 def dur_cycle_tables(runs, file_name):
     rows_mag = []
@@ -342,7 +353,6 @@ def dur_cycle_tables(runs, file_name):
 # -----------------------------
 # Streamlit App
 # -----------------------------
-
 st.set_page_config(page_title="CSV Overlay Plotter", layout="wide")
 st.title("CSV Overlay Plotter")
 uploaded = st.file_uploader("Select CSV files", type="csv", accept_multiple_files=True)
@@ -351,8 +361,7 @@ if uploaded:
     colors = generate_n_colors(len(uploaded))
     fig = go.Figure()
 
-    sf_rows_all = []  # existing SF summary (peaks/baselines at 3 pauses)
-    sf_pause_rows_all = []  # NEW: pause→1 cm peak table rows
+    sf_rows_precise = []
     dur_first_last_rows = []
     dur_cycle_mag_tables = {}
     dur_cycle_pos_tables = {}
@@ -376,21 +385,15 @@ if uploaded:
             # Overlay plot (no forced y=0)
             if len(runs) > 1:
                 for i, (cycle_label, x, y) in enumerate(runs):
-                    alpha = 0.1 + 0.9 * i / (len(runs) - 1) if len(runs) > 1 else 1.0
+                    alpha = 0.1 + 0.9 * i/(len(runs)-1) if len(runs) > 1 else 1.0
                     rgba = f"rgba({base[0]},{base[1]},{base[2]},{alpha})"
-                    show = (i == len(runs) - 1)
+                    show = (i == len(runs)-1)
                     name = file.name if show else None
-                    fig.add_trace(
-                        go.Scatter(
-                            x=x,
-                            y=y,
-                            mode="lines",
-                            line=dict(color=rgba),
-                            name=name,
-                            showlegend=show,
-                            legendgroup=file.name,
-                        )
-                    )
+                    fig.add_trace(go.Scatter(
+                        x=x, y=y, mode="lines",
+                        line=dict(color=rgba),
+                        name=name, showlegend=show, legendgroup=file.name
+                    ))
             else:
                 _, x, y = runs[0]
                 rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
@@ -398,115 +401,43 @@ if uploaded:
 
             fname_lower = file.name.lower()
 
-            # --- SF processing ---
+            # SF processing (use last run)
             if "sf" in fname_lower:
-                # analyze last run for SF summaries
                 _, x_sf, y_sf = runs[-1]
+                sf_rows_precise.extend(analyze_sf_precise(x_sf, y_sf, file.name))
 
-                # Existing corrected SF summary (pause peaks & baselines from same trace)
-                # Leaving this as-is for continuity with earlier versions
-                def analyze_sf_run_corrected(x, y, file_name):
-                    out = {
-                        "File": file_name,
-                        "Pause1 Peak (g)": np.nan,
-                        "Pause1 Baseline (g)": np.nan,
-                        "Pause1 %Inc": np.nan,
-                        "Pause2 Peak (g)": np.nan,
-                        "Pause2 Baseline (g)": np.nan,
-                        "Pause2 %Inc": np.nan,
-                        "Pause3 Peak (g)": np.nan,
-                        "Pause3 Baseline (g)": np.nan,
-                        "Pause3 %Inc": np.nan,
-                    }
-                    events = detect_three_pauses(x)
-                    if not events or len(events) < 3:
-                        return out
-                    for e in events:
-                        # For backward compatibility only (±0.5 cm symmetric window)
-                        # Not used for the new 1 cm directional peak report
-                        # Baseline: same-trace neighborhood
-                        def _baseline_same_trace(x, y, pause_num, pos, idx_center):
-                            x = np.asarray(x, dtype=float)
-                            y = np.asarray(y, dtype=float)
-                            idx = np.arange(len(x))
-                            if pause_num in (1, 3):
-                                before = (idx < idx_center) & (x >= pos - 1.0) & (x < pos)
-                                after = (idx > idx_center) & (x > pos) & (x <= pos + 1.5)
-                                sample = np.concatenate([y[before], y[after]])
-                            else:
-                                after_only = (idx > idx_center) & (x <= pos) & (x >= pos - 1.0)
-                                sample = y[after_only]
-                            if sample.size == 0:
-                                return np.nan
-                            return float(np.nanmean(sample))
-
-                        # Symmetric ±0.5 cm peak window for legacy output
-                        def _legacy_peak(x, y, pos, idx_center, direction):
-                            x = np.asarray(x, dtype=float)
-                            y = np.asarray(y, dtype=float)
-                            mask = (x >= pos - 0.5) & (x <= pos + 0.5)
-                            vals = y[mask]
-                            return float(np.nanmax(vals)) if direction >= 0 else float(np.nanmin(vals))
-
-                        peak = _legacy_peak(x, y, e["pos"], e["idx"], e["dir"]) 
-                        base = _baseline_same_trace(x, y, e["pause_num"], e["pos"], e["idx"]) 
-                        pct = np.nan
-                        if np.isfinite(base) and abs(base) >= 1e-9 and np.isfinite(peak):
-                            pct = (abs(peak) - abs(base)) / abs(base) * 100.0
-                        k = e["pause_num"]
-                        out[f"Pause{k} Peak (g)"] = round(float(peak), 3) if np.isfinite(peak) else np.nan
-                        out[f"Pause{k} Baseline (g)"] = round(float(base), 3) if np.isfinite(base) else np.nan
-                        out[f"Pause{k} %Inc"] = round(float(pct), 2) if np.isfinite(pct) else np.nan
-                    return out
-
-                sf_rows_all.append(analyze_sf_run_corrected(x_sf, y_sf, file.name))
-
-                # NEW: 1 cm directional peak report per pause
-                sf_pause_rows_all.extend(analyze_sf_pause_peaks(x_sf, y_sf, file.name))
-
-            # --- DUR processing ---
+            # DUR processing
             if "dur" in fname_lower:
                 dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
-                df_mag, df_pos = dur_cycle_tables(runs, file.name)
+                df_mag, df_pos = dur_cycle_tables(runs, file_name=file.name)
                 dur_cycle_mag_tables[file.name] = df_mag
                 dur_cycle_pos_tables[file.name] = df_pos
 
         except Exception as e:
             st.error(f"Error in file {file.name}: {e}")
 
-    # Overlay figure
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Encoder/Motor",
         yaxis_title="Prox",
         title="Overlay Plot",
+        height=900,
     )
-    st.plotly_chart(fig, use_container_width=True, height=900)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # --- SF outputs ---
-    if sf_pause_rows_all:
-        st.subheader("SF Pause → 1 cm Peak (direction-aware)")
-        df_sf_peaks = pd.DataFrame(sf_pause_rows_all)
-        st.dataframe(df_sf_peaks, use_container_width=True)
-        st.download_button(
-            "Download SF pause→1 cm peaks (CSV)",
-            data=df_sf_peaks.to_csv(index=False).encode("utf-8"),
-            file_name="sf_pause_1cm_peaks.csv",
-            mime="text/csv",
-        )
-
-    if sf_rows_all:
-        st.subheader("SF Static-Friction Summary (legacy window)")
-        df_sf = pd.DataFrame(sf_rows_all)
+    # SF output (precise rules)
+    if sf_rows_precise:
+        st.subheader("SF Pause → 1 cm Peak (precise rules)")
+        df_sf = pd.DataFrame(sf_rows_precise)
         st.dataframe(df_sf, use_container_width=True)
         st.download_button(
-            "Download SF legacy summary (CSV)",
+            "Download SF pause→1 cm peaks (CSV)",
             data=df_sf.to_csv(index=False).encode("utf-8"),
-            file_name="sf_static_friction_summary.csv",
+            file_name="sf_pause_1cm_peaks_precise.csv",
             mime="text/csv",
         )
 
-    # --- DUR outputs ---
+    # DUR outputs
     if dur_first_last_rows:
         st.subheader("DUR First/Last Cycle (Max |Force|)")
         df_dur = pd.DataFrame(dur_first_last_rows)
@@ -540,25 +471,21 @@ if uploaded:
             dfc['Cycle'] = pd.to_numeric(dfc['Cycle'], errors='coerce')
             dfc = dfc.sort_values('Cycle')
             r, g, b = color_map.get(name, (50, 50, 50))
-            fig2.add_trace(
-                go.Scatter(
-                    x=dfc['Cycle'],
-                    y=dfc['Peak Force (g)'],
-                    mode="lines+markers",
-                    name=name,
-                    line=dict(color=f"rgba({r},{g},{b},1)"),
-                    marker=dict(color=f"rgba({r},{g},{b},1)"),
-                )
-            )
-        # Force y-axis to start at 0 for DUR plot only
+            fig2.add_trace(go.Scatter(
+                x=dfc['Cycle'], y=dfc['Peak Force (g)'],
+                mode="lines+markers", name=name,
+                line=dict(color=f"rgba({r},{g},{b},1)"),
+                marker=dict(color=f"rgba({r},{g},{b},1)")
+            ))
         fig2.update_layout(
             template="plotly_white",
             xaxis_title="Cycle",
             yaxis_title="Peak Force (g)",
             title="Per-Cycle Peak Force (positive only)",
             yaxis=dict(range=[0, None], zeroline=True, zerolinewidth=1),
+            height=500,
         )
-        st.plotly_chart(fig2, use_container_width=True, height=500)
+        st.plotly_chart(fig2, use_container_width=True)
 
         combined_pos = pd.concat([v for v in dur_cycle_pos_tables.values()], ignore_index=True)
         st.download_button(
