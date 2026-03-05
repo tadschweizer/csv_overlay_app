@@ -617,10 +617,7 @@ if uploaded:
         )
 
     if dur_cycle_mag_tables:
-        st.subheader("DUR Per-Cycle Tables")
         combined_mag = pd.concat([v for v in dur_cycle_mag_tables.values()], ignore_index=True)
-        st.markdown("**Per-cycle Max |Force| (table)**")
-        st.dataframe(combined_mag, use_container_width=True)
         st.download_button(
             "Download per-cycle Max |Force| (CSV)",
             data=combined_mag.to_csv(index=False).encode("utf-8"),
