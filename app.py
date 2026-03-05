@@ -405,9 +405,50 @@ uploaded = st.file_uploader("Select CSV files", type="csv", accept_multiple_file
 
 if uploaded:
     colors = generate_n_colors(len(uploaded))
-    fig = go.Figure()
 
+    # -------------------------------------------------------
+    # IMPROVEMENT #3 & #11: File type detection + manual override
+    # -------------------------------------------------------
+    st.subheader("📋 File Detection Summary")
+    st.caption("Files without 'sf' or 'dur' in the name are unrecognized. Use the dropdowns to assign a type manually.")
+
+    file_type_overrides = {}
+    detection_rows = []
+    for file in uploaded:
+        fname_lower = file.name.lower()
+        if "sf" in fname_lower:
+            auto_type = "SF"
+        elif "dur" in fname_lower:
+            auto_type = "DUR"
+        else:
+            auto_type = "Unknown"
+        detection_rows.append({"File": file.name, "Auto-detected": auto_type})
+
+    # Show detection table and manual override selectors side by side
+    det_col, override_col = st.columns([2, 2])
+    with det_col:
+        st.dataframe(pd.DataFrame(detection_rows), use_container_width=True, hide_index=True)
+    with override_col:
+        st.markdown("**Manual overrides** (only needed for 'Unknown' files)")
+        for row in detection_rows:
+            if row["Auto-detected"] == "Unknown":
+                chosen = st.selectbox(
+                    f"{row['File']}",
+                    options=["Unknown (skip analysis)", "SF", "DUR"],
+                    key=f"override_{row['File']}",
+                )
+                file_type_overrides[row["File"]] = chosen
+            else:
+                file_type_overrides[row["File"]] = row["Auto-detected"]
+
+    st.divider()
+
+    # -------------------------------------------------------
+    # Main processing loop
+    # -------------------------------------------------------
+    fig = go.Figure()
     sf_rows_precise = []
+    sf_pause_markers = {}   # file.name → list of (pause_x, pause_y, pause_num)
     dur_first_last_rows = []
     dur_cycle_mag_tables = {}
     dur_cycle_pos_tables = {}
@@ -437,12 +478,9 @@ if uploaded:
                     name = file.name if show else None
                     fig.add_trace(
                         go.Scatter(
-                            x=x,
-                            y=y,
-                            mode="lines",
+                            x=x, y=y, mode="lines",
                             line=dict(color=rgba),
-                            name=name,
-                            showlegend=show,
+                            name=name, showlegend=show,
                             legendgroup=file.name,
                         )
                     )
@@ -451,15 +489,28 @@ if uploaded:
                 rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
                 fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba), name=file.name))
 
-            fname_lower = file.name.lower()
+            # Resolve effective file type (auto or manual override)
+            eff_type = file_type_overrides.get(file.name, "Unknown (skip analysis)")
 
-            # --- SF processing (use last run) ---
-            if "sf" in fname_lower:
+            # --- SF processing ---
+            if eff_type == "SF":
                 _, x_sf, y_sf = runs[-1]
-                sf_rows_precise.extend(analyze_sf_precise(x_sf, y_sf, file.name))
+                rows = analyze_sf_precise(x_sf, y_sf, file.name)
+                sf_rows_precise.extend(rows)
+
+                # IMPROVEMENT #6: collect pause marker positions on the last run trace
+                events = detect_pauses_three_strict(np.asarray(x_sf, dtype=float))
+                markers = []
+                for e in events:
+                    idx_p = e["idx"]
+                    if 0 <= idx_p < len(y_sf):
+                        markers.append((float(x_sf.iloc[idx_p] if hasattr(x_sf, 'iloc') else x_sf[idx_p]),
+                                        float(y_sf.iloc[idx_p] if hasattr(y_sf, 'iloc') else y_sf[idx_p]),
+                                        e["pause_num"]))
+                sf_pause_markers[file.name] = (markers, base)
 
             # --- DUR processing ---
-            if "dur" in fname_lower:
+            if eff_type == "DUR":
                 dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
                 df_mag, df_pos = dur_cycle_tables(runs, file_name=file.name)
                 dur_cycle_mag_tables[file.name] = df_mag
@@ -468,11 +519,29 @@ if uploaded:
         except Exception as e:
             st.error(f"Error in file {file.name}: {e}")
 
+    # IMPROVEMENT #6: Add SF pause markers to overlay plot
+    for fname, (markers, base) in sf_pause_markers.items():
+        r, g, b = base
+        for mx, my, pnum in markers:
+            fig.add_trace(go.Scatter(
+                x=[mx], y=[my],
+                mode="markers+text",
+                marker=dict(symbol="diamond", size=12, color=f"rgba({r},{g},{b},1)",
+                            line=dict(color="black", width=1.5)),
+                text=[f"P{pnum}"],
+                textposition="top center",
+                textfont=dict(size=10, color="black"),
+                name=f"{fname} pauses",
+                legendgroup=fname,
+                showlegend=False,
+                hovertemplate=f"<b>{fname}</b><br>Pause #{pnum}<br>X: {mx:.3f} cm<br>Y: {my:.3f} g<extra></extra>",
+            ))
+
     # Overlay figure
     fig.update_layout(
         template="plotly_white",
-        xaxis_title="Encoder/Motor",
-        yaxis_title="Prox",
+        xaxis_title="Encoder/Motor (cm)",
+        yaxis_title="Proximity (g)",
         title="Overlay Plot",
         height=900,
     )
@@ -483,6 +552,41 @@ if uploaded:
         st.subheader("SF Pause → 1 cm Peak (precise rules)")
         df_sf = pd.DataFrame(sf_rows_precise)[essential_sf_cols]
         st.dataframe(df_sf, use_container_width=True)
+
+        # IMPROVEMENT #10: Bar chart comparing Pre vs Peak across all SF files
+        st.markdown("**SF Pre vs Peak comparison across files**")
+        fig_sf_bar = go.Figure()
+        for pnum in sorted(df_sf["Pause #"].dropna().unique()):
+            sub = df_sf[df_sf["Pause #"] == pnum]
+            fig_sf_bar.add_trace(go.Bar(
+                name=f"Pause #{int(pnum)} — Pre",
+                x=sub["File"],
+                y=sub["Pre @ X±0.1 (g)"].abs(),
+                marker_color="steelblue",
+                offsetgroup=int(pnum),
+                legendgroup=f"p{int(pnum)}_pre",
+                hovertemplate="<b>%{x}</b><br>Pre: %{y:.3f} g<extra></extra>",
+            ))
+            fig_sf_bar.add_trace(go.Bar(
+                name=f"Pause #{int(pnum)} — Peak",
+                x=sub["File"],
+                y=sub["Peak ≤1cm After (g)"].abs(),
+                marker_color="tomato",
+                offsetgroup=int(pnum) + 0.4,
+                legendgroup=f"p{int(pnum)}_peak",
+                hovertemplate="<b>%{x}</b><br>Peak: %{y:.3f} g<extra></extra>",
+            ))
+        fig_sf_bar.update_layout(
+            template="plotly_white",
+            barmode="group",
+            xaxis_title="File",
+            yaxis_title="|Force| (g)",
+            title="SF Pre vs Peak Force by File & Pause",
+            height=420,
+            legend=dict(orientation="h", y=-0.25),
+        )
+        st.plotly_chart(fig_sf_bar, use_container_width=True)
+
         st.download_button(
             "Download SF pause→1 cm peaks (CSV)",
             data=df_sf.to_csv(index=False).encode("utf-8"),
@@ -494,6 +598,16 @@ if uploaded:
     if dur_first_last_rows:
         st.subheader("DUR First/Last Cycle (Max |Force|)")
         df_dur = pd.DataFrame(dur_first_last_rows)
+
+        # IMPROVEMENT #9: Add % change first → last
+        def _pct_change(row):
+            f = row.get("First Cycle Max |Force| (g)")
+            l = row.get("Last Cycle Max |Force| (g)")
+            if pd.notna(f) and pd.notna(l) and abs(f) >= 1e-12:
+                return round((l - f) / abs(f) * 100.0, 2)
+            return np.nan
+
+        df_dur["% Change (First→Last)"] = df_dur.apply(_pct_change, axis=1)
         st.dataframe(df_dur, use_container_width=True)
         st.download_button(
             "Download DUR first/last summary (CSV)",
