@@ -21,21 +21,25 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import colorsys
 from io import StringIO
+from datetime import datetime
 
 # -----------------------------
 # Plot colors
 # -----------------------------
 def generate_n_colors(n):
-    colors = []
-    for i in range(max(n, 1)):
-        hue = i / max(n, 1)
-        saturation = 0.65
-        value = 0.80
-        r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
-        colors.append((int(r * 255), int(g * 255), int(b * 255)))
-    return colors
+    # Colorblind-friendly palette (Okabe-Ito + extensions)
+    palette = [
+        (0, 114, 178),    # blue
+        (213, 94, 0),     # vermillion
+        (0, 158, 115),    # bluish green
+        (204, 121, 167),  # reddish purple
+        (240, 228, 66),   # yellow
+        (86, 180, 233),   # sky blue
+        (230, 159, 0),    # orange
+        (0, 0, 0),        # black
+    ]
+    return [palette[i % len(palette)] for i in range(max(n, 1))]
 
 # -----------------------------
 # CSV parsing
@@ -88,6 +92,18 @@ def extract_runs_from_df(df):
         xv = x[valid].reset_index(drop=True)
         yv = y[valid].reset_index(drop=True)
         return [(1, xv, yv)] if len(xv) >= 5 else []
+
+def validate_required_columns(df):
+    lowered = {c.lower(): c for c in df.columns}
+    has_prox = any('prox' in c for c in lowered.keys())
+    has_encoder = any('encoder' in c for c in lowered.keys())
+    has_motor = any('motor' in c for c in lowered.keys())
+    details = []
+    if not has_prox:
+        details.append("missing a 'prox' column")
+    if not (has_encoder or has_motor):
+        details.append("missing an 'encoder' or 'motor' position column")
+    return details
 
 # -----------------------------
 # Pause detection (dwell-based, position-grouped)
@@ -403,14 +419,23 @@ st.set_page_config(page_title="CSV Overlay Plotter", layout="wide")
 st.title("CSV Overlay Plotter")
 uploaded = st.file_uploader("Select CSV files", type="csv", accept_multiple_files=True)
 
+with st.expander("How to use this tool", expanded=not bool(uploaded)):
+    st.markdown(
+        "- Upload one or more CSV files.\n"
+        "- Expected fields include a force column containing `prox` and a position column containing `encoder` or `motor`.\n"
+        "- Files are auto-labeled SF/DUR from filename; unknown files can be manually assigned."
+    )
+
 if uploaded:
     colors = generate_n_colors(len(uploaded))
+    line_styles = ["solid", "dash", "dot", "dashdot"]
+    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
     # -------------------------------------------------------
     # IMPROVEMENT #3 & #11: File type detection + manual override
     # -------------------------------------------------------
     st.subheader("📋 File Detection Summary")
-    st.caption("Files without 'sf' or 'dur' in the name are unrecognized. Use the dropdowns to assign a type manually.")
+    st.caption("Files without 'sf', 'dur', or 'lub' in the name are unrecognized. Use the dropdowns to assign a type manually.")
 
     file_type_overrides = {}
     detection_rows = []
@@ -418,6 +443,8 @@ if uploaded:
         fname_lower = file.name.lower()
         if "sf" in fname_lower:
             auto_type = "SF"
+        elif "lub" in fname_lower:
+            auto_type = "LUB"
         elif "dur" in fname_lower:
             auto_type = "DUR"
         else:
@@ -434,12 +461,31 @@ if uploaded:
             if row["Auto-detected"] == "Unknown":
                 chosen = st.selectbox(
                     f"{row['File']}",
-                    options=["Unknown (skip analysis)", "SF", "DUR"],
+                    options=["Unknown (skip analysis)", "SF", "DUR", "LUB"],
                     key=f"override_{row['File']}",
                 )
                 file_type_overrides[row["File"]] = chosen
             else:
                 file_type_overrides[row["File"]] = row["Auto-detected"]
+
+    unknown_count = sum(v == "Unknown (skip analysis)" for v in file_type_overrides.values())
+    if unknown_count:
+        st.warning(f"{unknown_count} file(s) will be skipped unless you assign SF, DUR, or LUB.")
+
+    selected_categories = st.multiselect(
+        "Analyze/plot categories",
+        options=["DUR", "LUB", "SF"],
+        default=["DUR", "LUB", "SF"],
+    )
+    known_files = [
+        f.name for f in uploaded
+        if file_type_overrides.get(f.name) in selected_categories
+    ]
+    selected_overlay_files = st.multiselect(
+        "Overlay visibility: choose files to plot",
+        options=known_files,
+        default=known_files,
+    )
 
     st.divider()
 
@@ -448,29 +494,41 @@ if uploaded:
     # -------------------------------------------------------
     fig = go.Figure()
     sf_rows_precise = []
-    sf_pause_markers = {}   # file.name → list of (pause_x, pause_y, pause_num)
     dur_first_last_rows = []
     dur_cycle_mag_tables = {}
     dur_cycle_pos_tables = {}
     color_map = {}
+    file_status = []
+    progress = st.progress(0.0, text="Preparing analysis...")
+    status_box = st.empty()
 
     for idx, file in enumerate(uploaded):
         try:
             df = read_csv_with_flexible_header(StringIO(file.getvalue().decode("utf-8-sig")))
             if df is None or df.empty:
-                st.warning(f"Skipped {file.name}: could not find expected header.")
+                file_status.append({"File": file.name, "Status": "Skipped", "Details": "Could not find expected header row with prox + encoder/motor."})
+                continue
+
+            issues = validate_required_columns(df)
+            if issues:
+                file_status.append({"File": file.name, "Status": "Skipped", "Details": "; ".join(issues)})
                 continue
 
             runs = extract_runs_from_df(df)
             if not runs:
-                st.warning(f"Skipped {file.name}: no valid numeric rows.")
+                file_status.append({"File": file.name, "Status": "Skipped", "Details": "No valid numeric rows after parsing position/force fields."})
                 continue
 
             base = colors[idx]
             color_map[file.name] = base
+            dash = line_styles[idx % len(line_styles)]
+            eff_type = file_type_overrides.get(file.name, "Unknown (skip analysis)")
+            if eff_type not in selected_categories:
+                file_status.append({"File": file.name, "Status": "Skipped", "Details": f"Not in selected categories ({', '.join(selected_categories)})"})
+                continue
 
             # Overlay plot (no forced y=0)
-            if len(runs) > 1:
+            if file.name in selected_overlay_files and len(runs) > 1:
                 for i, (cycle_label, x, y) in enumerate(runs):
                     alpha = 0.1 + 0.9 * i / (len(runs) - 1) if len(runs) > 1 else 1.0
                     rgba = f"rgba({base[0]},{base[1]},{base[2]},{alpha})"
@@ -479,18 +537,15 @@ if uploaded:
                     fig.add_trace(
                         go.Scatter(
                             x=x, y=y, mode="lines",
-                            line=dict(color=rgba),
+                            line=dict(color=rgba, dash=dash),
                             name=name, showlegend=show,
                             legendgroup=file.name,
                         )
                     )
-            else:
+            elif file.name in selected_overlay_files:
                 _, x, y = runs[0]
                 rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
-                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba), name=file.name))
-
-            # Resolve effective file type (auto or manual override)
-            eff_type = file_type_overrides.get(file.name, "Unknown (skip analysis)")
+                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba, dash=dash), name=file.name))
 
             # --- SF processing ---
             if eff_type == "SF":
@@ -498,66 +553,46 @@ if uploaded:
                 rows = analyze_sf_precise(x_sf, y_sf, file.name)
                 sf_rows_precise.extend(rows)
 
-                # IMPROVEMENT #6: collect pause marker positions on the last run trace
-                events = detect_pauses_three_strict(np.asarray(x_sf, dtype=float))
-                markers = []
-                for e in events:
-                    idx_p = e["idx"]
-                    if 0 <= idx_p < len(y_sf):
-                        markers.append((float(x_sf.iloc[idx_p] if hasattr(x_sf, 'iloc') else x_sf[idx_p]),
-                                        float(y_sf.iloc[idx_p] if hasattr(y_sf, 'iloc') else y_sf[idx_p]),
-                                        e["pause_num"]))
-                sf_pause_markers[file.name] = (markers, base)
-
             # --- DUR processing ---
-            if eff_type == "DUR":
+            if eff_type in ("DUR", "LUB"):
                 dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
                 df_mag, df_pos = dur_cycle_tables(runs, file_name=file.name)
                 dur_cycle_mag_tables[file.name] = df_mag
                 dur_cycle_pos_tables[file.name] = df_pos
 
+            file_status.append({"File": file.name, "Status": "Processed", "Details": f"Type={eff_type}; runs={len(runs)}"})
+
         except Exception as e:
             st.error(f"Error in file {file.name}: {e}")
-
-    # IMPROVEMENT #6: Add SF pause markers to overlay plot
-    for fname, (markers, base) in sf_pause_markers.items():
-        r, g, b = base
-        for mx, my, pnum in markers:
-            fig.add_trace(go.Scatter(
-                x=[mx], y=[my],
-                mode="markers+text",
-                marker=dict(symbol="diamond", size=12, color=f"rgba({r},{g},{b},1)",
-                            line=dict(color="black", width=1.5)),
-                text=[f"P{pnum}"],
-                textposition="top center",
-                textfont=dict(size=10, color="black"),
-                name=f"{fname} pauses",
-                legendgroup=fname,
-                showlegend=False,
-                hovertemplate=f"<b>{fname}</b><br>Pause #{pnum}<br>X: {mx:.3f} cm<br>Y: {my:.3f} g<extra></extra>",
-            ))
+            file_status.append({"File": file.name, "Status": "Error", "Details": str(e)})
+        finally:
+            progress_value = (idx + 1) / len(uploaded)
+            progress.progress(progress_value, text=f"Processed {idx + 1}/{len(uploaded)} file(s)")
+            status_box.dataframe(pd.DataFrame(file_status), use_container_width=True, hide_index=True)
 
     # Overlay figure
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Encoder/Motor (cm)",
-        yaxis_title="Proximity (g)",
+        yaxis_title="Force (g)",
         title="Overlay Plot",
-        height=900,
+        height=650,
     )
     st.plotly_chart(fig, use_container_width=True)
 
     # --- SF output (precise rules) ---
     if sf_rows_precise:
         st.subheader("SF Pause → 1 cm Peak (precise rules)")
-        df_sf = pd.DataFrame(sf_rows_precise)[essential_sf_cols]
+        df_sf = pd.DataFrame(sf_rows_precise)[essential_sf_cols].sort_values(["Pause #", "File"])
         st.dataframe(df_sf, use_container_width=True)
 
         # IMPROVEMENT #10: Bar chart comparing Pre vs Peak across all SF files
         st.markdown("**SF Pre vs Peak comparison across files**")
+        sf_files = sorted(df_sf["File"].dropna().unique().tolist())
+        sf_selected_files = st.multiselect("Select SF files to compare", sf_files, default=sf_files)
         fig_sf_bar = go.Figure()
         for pnum in sorted(df_sf["Pause #"].dropna().unique()):
-            sub = df_sf[df_sf["Pause #"] == pnum]
+            sub = df_sf[(df_sf["Pause #"] == pnum) & (df_sf["File"].isin(sf_selected_files))]
             fig_sf_bar.add_trace(go.Bar(
                 name=f"Pause #{int(pnum)} — Pre",
                 x=sub["File"],
@@ -590,13 +625,13 @@ if uploaded:
         st.download_button(
             "Download SF pause→1 cm peaks (CSV)",
             data=df_sf.to_csv(index=False).encode("utf-8"),
-            file_name="sf_pause_1cm_peaks_precise.csv",
+            file_name=f"sf_pause_1cm_peaks_precise_{run_stamp}.csv",
             mime="text/csv",
         )
 
-    # --- DUR outputs ---
+    # --- DUR/LUB outputs ---
     if dur_first_last_rows:
-        st.subheader("DUR First/Last Cycle (Max |Force|)")
+        st.subheader("DUR/LUB First/Last Cycle (Max |Force|)")
         df_dur = pd.DataFrame(dur_first_last_rows)
 
         # IMPROVEMENT #9: Add % change first → last
@@ -608,11 +643,22 @@ if uploaded:
             return np.nan
 
         df_dur["% Change (First→Last)"] = df_dur.apply(_pct_change, axis=1)
-        st.dataframe(df_dur, use_container_width=True)
+        df_dur = df_dur.sort_values("% Change (First→Last)", ascending=False)
+        st.dataframe(
+            df_dur,
+            use_container_width=True,
+            column_config={
+                "% Change (First→Last)": st.column_config.NumberColumn(
+                    "% Change (First→Last)",
+                    format="%.2f%%",
+                    help="Percent change in max |force| from first to last cycle.",
+                )
+            },
+        )
         st.download_button(
             "Download DUR first/last summary (CSV)",
             data=df_dur.to_csv(index=False).encode("utf-8"),
-            file_name="dur_first_last_max_magnitude.csv",
+            file_name=f"dur_first_last_max_magnitude_{run_stamp}.csv",
             mime="text/csv",
         )
 
@@ -621,14 +667,14 @@ if uploaded:
         st.download_button(
             "Download per-cycle Max |Force| (CSV)",
             data=combined_mag.to_csv(index=False).encode("utf-8"),
-            file_name="dur_per_cycle_max_magnitude.csv",
+            file_name=f"dur_per_cycle_max_magnitude_{run_stamp}.csv",
             mime="text/csv",
         )
 
     if dur_cycle_pos_tables:
-        st.subheader("DUR Per-Cycle Peak Force Plot (positive only)")
+        st.subheader("DUR/LUB Per-Cycle Peak Force Plot (positive only)")
         all_files = list(dur_cycle_pos_tables.keys())
-        selected = st.multiselect("Select DUR files to compare", all_files, default=all_files)
+        selected = st.multiselect("Select DUR/LUB files to compare", all_files, default=all_files)
         fig2 = go.Figure()
         for name in selected:
             dfc = dur_cycle_pos_tables[name].copy()
@@ -642,7 +688,7 @@ if uploaded:
                     mode="lines+markers",
                     name=name,
                     line=dict(color=f"rgba({r},{g},{b},1)"),
-                    marker=dict(color=f"rgba({r},{g},{b},1)"),
+                    marker=dict(color=f"rgba({r},{g},{b},1)", symbol="diamond"),
                 )
             )
         fig2.update_layout(
@@ -659,6 +705,6 @@ if uploaded:
         st.download_button(
             "Download per-cycle Peak Force (CSV)",
             data=combined_pos.to_csv(index=False).encode("utf-8"),
-            file_name="dur_per_cycle_peak_force.csv",
+            file_name=f"dur_per_cycle_peak_force_{run_stamp}.csv",
             mime="text/csv",
         )
