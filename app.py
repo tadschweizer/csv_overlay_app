@@ -472,14 +472,9 @@ if uploaded:
     if unknown_count:
         st.warning(f"{unknown_count} file(s) will be skipped unless you assign SF, DUR, or LUB.")
 
-    selected_categories = st.multiselect(
-        "Analyze/plot categories",
-        options=["DUR", "LUB", "SF"],
-        default=["DUR", "LUB", "SF"],
-    )
     known_files = [
         f.name for f in uploaded
-        if file_type_overrides.get(f.name) in selected_categories
+        if file_type_overrides.get(f.name) in ("DUR", "LUB", "SF")
     ]
     selected_overlay_files = st.multiselect(
         "Overlay visibility: choose files to plot",
@@ -498,6 +493,7 @@ if uploaded:
     dur_cycle_mag_tables = {}
     dur_cycle_pos_tables = {}
     color_map = {}
+    overlay_trace_types = []
     file_status = []
     progress = st.progress(0.0, text="Preparing analysis...")
     status_box = st.empty()
@@ -523,8 +519,8 @@ if uploaded:
             color_map[file.name] = base
             dash = line_styles[idx % len(line_styles)]
             eff_type = file_type_overrides.get(file.name, "Unknown (skip analysis)")
-            if eff_type not in selected_categories:
-                file_status.append({"File": file.name, "Status": "Skipped", "Details": f"Not in selected categories ({', '.join(selected_categories)})"})
+            if eff_type not in ("DUR", "LUB", "SF"):
+                file_status.append({"File": file.name, "Status": "Skipped", "Details": "Type is Unknown (skip analysis)."})
                 continue
 
             # Overlay plot (no forced y=0)
@@ -542,10 +538,12 @@ if uploaded:
                             legendgroup=file.name,
                         )
                     )
+                    overlay_trace_types.append(eff_type)
             elif file.name in selected_overlay_files:
                 _, x, y = runs[0]
                 rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
-                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba, dash=dash), name=file.name))
+                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba, dash=dash), name=file.name, legendgroup=file.name))
+                overlay_trace_types.append(eff_type)
 
             # --- SF processing ---
             if eff_type == "SF":
@@ -571,6 +569,46 @@ if uploaded:
             status_box.dataframe(pd.DataFrame(file_status), use_container_width=True, hide_index=True)
 
     # Overlay figure
+    if overlay_trace_types:
+        visible_all = [True] * len(overlay_trace_types)
+        visible_sf = [t == "SF" for t in overlay_trace_types]
+        visible_dur = [t == "DUR" for t in overlay_trace_types]
+        visible_lub = [t == "LUB" for t in overlay_trace_types]
+        visible_dur_lub = [t in ("DUR", "LUB") for t in overlay_trace_types]
+
+        fig.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="right",
+                    x=0.0,
+                    y=1.18,
+                    xanchor="left",
+                    yanchor="top",
+                    showactive=True,
+                    buttons=[
+                        dict(label="All", method="update", args=[{"visible": visible_all}]),
+                        dict(label="SF only", method="update", args=[{"visible": visible_sf}]),
+                        dict(label="DUR only", method="update", args=[{"visible": visible_dur}]),
+                        dict(label="LUB only", method="update", args=[{"visible": visible_lub}]),
+                        dict(label="DUR + LUB", method="update", args=[{"visible": visible_dur_lub}]),
+                    ],
+                )
+            ],
+            annotations=[
+                dict(
+                    text="Quick filter:",
+                    x=0,
+                    y=1.2,
+                    xref="paper",
+                    yref="paper",
+                    showarrow=False,
+                    xanchor="left",
+                    font=dict(size=12),
+                )
+            ],
+        )
+
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Encoder/Motor (cm)",
