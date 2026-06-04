@@ -551,9 +551,11 @@ if uploaded:
                 rows = analyze_sf_precise(x_sf, y_sf, file.name)
                 sf_rows_precise.extend(rows)
 
-            # --- DUR processing ---
-            if eff_type in ("DUR", "LUB"):
+            # --- DUR/LUB processing ---
+            if eff_type == "DUR":
                 dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
+
+            if eff_type in ("DUR", "LUB"):
                 df_mag, df_pos = dur_cycle_tables(runs, file_name=file.name)
                 dur_cycle_mag_tables[file.name] = df_mag
                 dur_cycle_pos_tables[file.name] = df_pos
@@ -669,7 +671,7 @@ if uploaded:
 
     # --- DUR/LUB outputs ---
     if dur_first_last_rows:
-        st.subheader("DUR/LUB First/Last Cycle (Max |Force|)")
+        st.subheader("DUR First/Last Cycle (Max |Force|)")
         df_dur = pd.DataFrame(dur_first_last_rows)
 
         # IMPROVEMENT #9: Add % change first → last
