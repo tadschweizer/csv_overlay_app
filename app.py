@@ -1,750 +1,175 @@
 # -*- coding: utf-8 -*-
 """
-CSV Overlay Plotter (v3.9.2)
+ADV/PB Track Tester Analyzer (v4.0.0)  -  Streamlit UI
 
-SF improvements (combined):
-- Robust dwell-based pause detection: identifies low-x (~20 cm) twice and high-x (~35 cm) once.
-- Pre value sampled at EXACT Xp ± 0.100 cm (snapped to 3 decimals), using:
-  • latest sample BEFORE the pause on the correct approach pass (tight band ±0.02 → ±0.05 → ±0.10)
-  • fallback to on-side linear interpolation if needed
-- Post ‘peak’ = extreme within the first 1.0 cm AFTER the pause in the motion direction (max if +, min if −).
-- Turnaround (Pause #2) also reports y at (Xp − 1.000 cm) AFTER the pause and Δ = peak − that value.
-- For Pause #3 specifically, approach is enforced to pullback so pre sample is at Xp + 0.100 (~20.100 cm) and negative.
-
-DUR behavior unchanged:
-- Overlay plot (no forced y = 0).
-- Per-cycle positive-only peak plot with y-axis starting at 0.
-- No idxmax/index usage on user DataFrames.
+Analysis logic lives in the `advpb` package; this file is UI only.
+Run:  streamlit run app.py
 """
+from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from io import StringIO
 from datetime import datetime
 
-# -----------------------------
-# Plot colors
-# -----------------------------
-def generate_n_colors(n):
-    # Colorblind-friendly palette (Okabe-Ito + extensions)
-    palette = [
-        (0, 114, 178),    # blue
-        (213, 94, 0),     # vermillion
-        (0, 158, 115),    # bluish green
-        (204, 121, 167),  # reddish purple
-        (240, 228, 66),   # yellow
-        (86, 180, 233),   # sky blue
-        (230, 159, 0),    # orange
-        (0, 0, 0),        # black
+import pandas as pd
+import streamlit as st
+
+from advpb import __version__
+from advpb.analysis import analyze
+from advpb.export import to_excel, to_html
+from advpb.parsing import parse_file
+from advpb import plots
+
+st.set_page_config(page_title="ADV/PB Analyzer", layout="wide")
+st.title("ADV/PB Track Tester Analyzer")
+st.caption(f"v{__version__} · Force sign: + = advance/push, − = pullback/pull")
+
+
+# ------------------------------------------------------------------
+# Cached work - files are parsed/analyzed once, not on every widget click
+# ------------------------------------------------------------------
+@st.cache_data(show_spinner=False, max_entries=200)
+def cached_parse(name: str, raw: bytes):
+    return parse_file(name, raw)
+
+
+@st.cache_data(show_spinner="Analyzing...")
+def cached_analyze(payload: tuple):
+    """payload = tuple of (name, raw bytes, test type). Hashable -> cache key."""
+    files = []
+    for name, raw, ttype in payload:
+        tf = cached_parse(name, raw)
+        tf.test_type = ttype
+        files.append(tf)
+    return files, analyze(files)
+
+
+@st.cache_data(show_spinner="Building export files...")
+def cached_exports(payload: tuple):
+    files, tables = cached_analyze(payload)
+    labels = {f.name: f"ln {f.lot} S#{f.sample}" for f in files}
+    figs = [
+        plots.sf_breakaway_bar(tables["SF Breakaway"]),
+        plots.dur_trend(tables["DUR Per-Cycle"], labels),
+        plots.overlay([f for f in files if f.test_type == "SF"], "SF Force vs Position"),
+        plots.overlay([f for f in files if f.test_type == "LUB"], "LUB Force vs Position"),
     ]
-    return [palette[i % len(palette)] for i in range(max(n, 1))]
+    return to_excel(tables), to_html(tables, figs)
 
-# -----------------------------
-# CSV parsing
-# -----------------------------
-def read_csv_with_flexible_header(file_like):
-    text = file_like.read()
-    if isinstance(text, bytes):
-        text = text.decode("utf-8-sig", errors="ignore")
-    lines = text.splitlines()
-    header_index = None
-    for i, line in enumerate(lines):
-        low = line.lower()
-        if 'prox' in low and ('encoder' in low or 'motor' in low):
-            header_index = i
-            break
-    if header_index is None:
-        return None
-    csv_data = "\n".join(lines[header_index:])  # IMPORTANT: single-line join
-    df = pd.read_csv(StringIO(csv_data), engine='python', on_bad_lines='skip')
-    df.columns = df.columns.str.strip()
-    return df
 
-def extract_runs_from_df(df):
-    encoder = [c for c in df.columns if 'encoder' in c.lower()]
-    motor = [c for c in df.columns if 'motor' in c.lower()]
-    x_col = encoder[0] if encoder else (motor[0] if motor else None)
-    prox_col = [c for c in df.columns if 'prox' in c.lower()]
-    if x_col is None or not prox_col:
-        return []
-    prox_col = prox_col[0]
-
-    cycle_cols = [c for c in df.columns if c.lower() == 'cycle']
-    if cycle_cols:
-        df['cycle_num'] = pd.to_numeric(df[cycle_cols[0]], errors='coerce')
-        runs = []
-        for cycle in sorted(df['cycle_num'].dropna().unique()):
-            sub = df[df['cycle_num'] == cycle].copy()
-            x = pd.to_numeric(sub[x_col], errors='coerce')
-            y = pd.to_numeric(sub[prox_col], errors='coerce')
-            valid = ~(x.isna() | y.isna())
-            xv = x[valid].reset_index(drop=True)
-            yv = y[valid].reset_index(drop=True)
-            if len(xv) >= 5:
-                runs.append((int(cycle), xv, yv))
-        return runs
+def show(df: pd.DataFrame, **kw):
+    if df is None or df.empty:
+        st.info("No data for this test type.")
     else:
-        x = pd.to_numeric(df[x_col], errors='coerce')
-        y = pd.to_numeric(df[prox_col], errors='coerce')
-        valid = ~(x.isna() | y.isna())
-        xv = x[valid].reset_index(drop=True)
-        yv = y[valid].reset_index(drop=True)
-        return [(1, xv, yv)] if len(xv) >= 5 else []
+        st.dataframe(df.reset_index(drop=True), use_container_width=True, hide_index=True, **kw)
 
-def validate_required_columns(df):
-    lowered = {c.lower(): c for c in df.columns}
-    has_prox = any('prox' in c for c in lowered.keys())
-    has_encoder = any('encoder' in c for c in lowered.keys())
-    has_motor = any('motor' in c for c in lowered.keys())
-    details = []
-    if not has_prox:
-        details.append("missing a 'prox' column")
-    if not (has_encoder or has_motor):
-        details.append("missing an 'encoder' or 'motor' position column")
-    return details
 
-# -----------------------------
-# Pause detection (dwell-based, position-grouped)
-# -----------------------------
-def _dense_x_centers(x, bin_width=0.05, topk=20):
-    x = np.asarray(x, dtype=float)
-    if x.size < 20:
-        return np.array([]), np.array([])
-    xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
-    if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
-        return np.array([]), np.array([])
-    n_bins = max(20, int(np.ceil((xmax - xmin) / bin_width)))
-    edges = np.linspace(xmin, xmax, n_bins + 1)
-    counts, _ = np.histogram(x, bins=edges)
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    idx = np.argsort(counts)[::-1][:topk]
-    return centers[idx], counts[idx]
+# ------------------------------------------------------------------
+# Upload + type detection
+# ------------------------------------------------------------------
+uploaded = st.file_uploader("Select tester CSV files (SF, LUB, DUR)", type="csv", accept_multiple_files=True)
 
-def _pause_blocks_from_center(x, center, tol=0.25, min_gap=80):
-    x = np.asarray(x, dtype=float)
-    mask = np.abs(x - center) <= tol
-    idxs = np.where(mask)[0]
-    if idxs.size == 0:
-        return []
-    blocks = []
-    start = idxs[0]
-    prev = idxs[0]
-    for k in idxs[1:]:
-        if k - prev > min_gap:
-            blocks.append((start, prev))
-            start = k
-        prev = k
-    blocks.append((start, prev))
-    return blocks
-
-def detect_pauses_three_strict(x):
-    """
-    Return three pauses: low-x twice (~20 cm) and high-x once (~35 cm).
-    Each pause dict has: pause_num, idx, pos, dir (post-pause motion sign).
-    """
-    x = np.asarray(x, dtype=float)
-    centers, _ = _dense_x_centers(x, bin_width=0.05, topk=20)
-    if len(centers) == 0:
-        return []
-
-    cand_blocks = []
-    for c in centers:
-        for s, e in _pause_blocks_from_center(x, c, tol=0.25, min_gap=80):
-            xm = float(np.nanmedian(x[s:e+1]))
-            cand_blocks.append({"start": int(s), "end": int(e), "x_med": xm, "len": int(e - s + 1)})
-    if not cand_blocks:
-        return []
-
-    # Group by position using 0.5 cm buckets
-    groups = {}
-    for b in cand_blocks:
-        key = round(b["x_med"] * 2) / 2.0
-        groups.setdefault(key, []).append(b)
-
-    # Pick the two strongest dwell positions (expected: ~20 and ~35)
-    items = [(k, sum(bb["len"] for bb in v), v) for k, v in groups.items()]
-    items.sort(key=lambda t: t[1], reverse=True)
-    if len(items) < 2:
-        # Fallback: earliest 3 by time
-        blocks = sorted(cand_blocks, key=lambda b: b["start"])[:3]
-        evts = []
-        for i, b in enumerate(blocks, 1):
-            idxc = (b["start"] + b["end"]) // 2
-            post_slope = np.nanmedian(np.diff(x[idxc:idxc+10]))
-            dir_sign = 1 if (np.isfinite(post_slope) and post_slope >= 0) else -1
-            evts.append({"pause_num": i, "idx": idxc, "pos": b["x_med"], "dir": dir_sign})
-        return evts
-
-    (pA, _, blocksA), (pB, _, blocksB) = items[0], items[1]
-    if pA > pB:
-        high_blocks = blocksA
-        low_blocks = blocksB
-    else:
-        high_blocks = blocksB
-        low_blocks = blocksA
-
-    low_blocks_sorted = sorted(low_blocks, key=lambda b: b["start"])
-    high_blocks_sorted = sorted(high_blocks, key=lambda b: b["start"])
-
-    p1b = low_blocks_sorted[0]
-    p3b = low_blocks_sorted[-1]
-    p2b = high_blocks_sorted[0]
-
-    p1 = {"pause_num": 1, "idx": (p1b["start"] + p1b["end"]) // 2,
-          "pos": float(np.nanmedian(x[p1b["start"]:p1b["end"]+1])), "dir": 1}
-    p2 = {"pause_num": 2, "idx": (p2b["start"] + p2b["end"]) // 2,
-          "pos": float(np.nanmedian(x[p2b["start"]:p2b["end"]+1])), "dir": -1}
-    p3 = {"pause_num": 3, "idx": (p3b["start"] + p3b["end"]) // 2,
-          "pos": float(np.nanmedian(x[p3b["start"]:p3b["end"]+1])), "dir": -1}
-    return [p1, p2, p3]
-
-# -----------------------------
-# SF helpers (pre/post rules)
-# -----------------------------
-def _nearest_in_band_index(x, band_lo, band_hi, idx_limit=None, side="before"):
-    x = np.asarray(x, dtype=float)
-    idx = np.arange(len(x))
-    mask = np.isfinite(x) & (x >= band_lo) & (x <= band_hi)
-    if idx_limit is not None:
-        mask &= (idx < idx_limit) if side == "before" else (idx > idx_limit)
-    cand = np.where(mask)[0]
-    if cand.size == 0:
-        return None
-    # choose latest before or earliest after relative to the pause index
-    return int(cand[-1] if side == "before" else cand[0])
-
-def _interpolate_at_target(x, y, x_target, idx_limit=None, side="before", look=800):
-    # Linear interpolation on the specified side of idx_center
-    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
-    if idx_limit is None:
-        return np.nan
-    if side == "before":
-        i0 = max(0, idx_limit - look); i1 = idx_limit - 1
-        rng = range(i1, i0, -1)  # walk backward
-    else:
-        i0 = idx_limit + 1; i1 = min(len(x) - 1, idx_limit + look)
-        rng = range(i0, i1)     # walk forward
-    prev_i = None
-    for i in rng:
-        if prev_i is None:
-            prev_i = i
-            continue
-        xa, xb = x[prev_i], x[i]
-        if (xa - x_target) * (xb - x_target) <= 0 and np.isfinite(xa) and np.isfinite(xb):
-            ya, yb = y[prev_i], y[i]
-            if not (np.isfinite(ya) and np.isfinite(yb)):
-                prev_i = i; continue
-            if abs(xb - xa) < 1e-12:
-                return float(ya)
-            t = (x_target - xa) / (xb - xa)
-            return float(ya + t * (yb - ya))
-        prev_i = i
-    return np.nan
-
-def _value_at_exact_offset(x, y, pos, idx_center, offset, side="before"):
-    """
-    Sample y at x_target = round(pos + offset, 3).
-    Prefer the latest sample BEFORE the pause (or earliest AFTER) in a tight band, else widen, else interpolate.
-    This avoids grabbing the other pass at the same x.
-    """
-    x_target = round(pos + offset, 3)  # e.g., 20.000 - 0.100 => 19.900; or +0.100 => 20.100
-    for tol in (0.02, 0.05, 0.10):
-        lo, hi = x_target - tol, x_target + tol
-        j = _nearest_in_band_index(x, lo, hi, idx_limit=idx_center, side=side)
-        if j is not None:
-            return float(y[j]), float(x[j]), j
-    val = _interpolate_at_target(x, y, x_target, idx_limit=idx_center, side=side, look=800)
-    return (float(val) if np.isfinite(val) else np.nan), float(x_target), None
-
-def _peak_after_pause_1cm(x, y, pos, idx_center, direction, win_cm=1.0):
-    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
-    idx = np.arange(len(x))
-    mask = idx > idx_center
-    if direction >= 0:
-        mask &= (x >= pos) & (x <= pos + win_cm)
-        vals = y[mask]
-        return np.nan if vals.size == 0 else float(np.nanmax(vals))
-    else:
-        mask &= (x <= pos) & (x >= pos - win_cm)
-        vals = y[mask]
-        return np.nan if vals.size == 0 else float(np.nanmin(vals))
-
-essential_sf_cols = [
-    "File","Pause #","Pause X (cm)","Approach Dir","Post Dir",
-    "Pre X used (cm)","Pre @ X±0.1 (g)","Peak ≤1cm After (g)","% Change vs Pre",
-    "Post X used (cm)","Post @ (X-1.0) (g)","Δ Peak - Post@1cm (g)"
-]
-
-def analyze_sf_precise(x, y, file_name):
-    """
-    Precise SF analysis:
-    - Pre value at EXACT Xp ± 0.100 cm (snapped) on the correct approach pass (rows BEFORE the pause).
-    - Post peak = extreme within 1.0 cm AFTER the pause in motion direction.
-    - Turnaround (#2): also sample Xp - 1.000 cm AFTER and report Δ.
-    - Pause #3 approach is enforced to pullback to guarantee Xp + 0.100 sampling on the pullback pass.
-    """
-    def _approach_dir_robust_local(x_arr, idx_center, pos, lookback=400, margin=0.2):
-        """
-        Robust approach direction:
-        - Look back 'lookback' samples.
-        - Ignore points within 'margin' cm of the dwell X (de-jitter).
-        - If far-median(x) > pos → approached from high x → direction = -1 (pullback).
-          Else from low x → +1 (advance).
-        """
-        x_arr = np.asarray(x_arr, dtype=float)
-        i0 = max(0, idx_center - lookback)
-        seg = x_arr[i0:idx_center]
-        seg = seg[np.isfinite(seg)]
-        if seg.size == 0:
-            return 1
-        seg_far = seg[np.abs(seg - pos) >= margin]
-        if seg_far.size == 0:
-            seg_far = seg
-        med = np.nanmedian(seg_far)
-        return -1 if med > pos else 1
-
-    rows = []
-    events = detect_pauses_three_strict(x)
-
-    for e in events:
-        # robust approach direction
-        appr = _approach_dir_robust_local(x, e["idx"], e["pos"])
-
-        # enforce Pause #3 as pullback (ensures pre at Xp + 0.100 and negative)
-        if e.get("pause_num") == 3:
-            appr = -1
-
-        # Pre sample: BEFORE the pause, at Xp ± 0.100 depending on approach
-        pre_off = -0.1 if appr >= 0 else +0.1    # advance → 19.900 ; pullback → 20.100 (for Xp≈20)
-        pre_val, pre_x_used, _ = _value_at_exact_offset(
-            x, y, e["pos"], e["idx"], pre_off, side="before"
-        )
-
-        # Post peak within 1 cm in motion direction
-        peak = _peak_after_pause_1cm(x, y, e["pos"], e["idx"], e["dir"], win_cm=1.0)
-
-        # % change vs pre (magnitude-based)
-        pct = np.nan
-        if np.isfinite(pre_val) and abs(pre_val) >= 1e-12 and np.isfinite(peak):
-            pct = (abs(peak) - abs(pre_val)) / abs(pre_val) * 100.0
-
-        # Turnaround (#2): sample at Xp - 1.000 AFTER the pause and Δ
-        post1_val = np.nan
-        post1_x_used = np.nan
-        delta = np.nan
-        if e["pause_num"] == 2:
-            post1_val, post1_x_used, _ = _value_at_exact_offset(
-                x, y, e["pos"], e["idx"], -1.0, side="after"
-            )
-            if np.isfinite(peak) and np.isfinite(post1_val):
-                delta = float(peak - post1_val)
-
-        rows.append({
-            "File": file_name,
-            "Pause #": e["pause_num"],
-            "Pause X (cm)": round(float(e["pos"]), 3),
-            "Approach Dir": "pos" if appr >= 0 else "neg",
-            "Post Dir": "pos" if e["dir"] >= 0 else "neg",
-            "Pre X used (cm)": round(pre_x_used, 3) if np.isfinite(pre_x_used) else np.nan,
-            "Pre @ X±0.1 (g)": round(pre_val, 3) if np.isfinite(pre_val) else np.nan,
-            "Peak ≤1cm After (g)": round(peak, 3) if np.isfinite(peak) else np.nan,
-            "% Change vs Pre": round(pct, 2) if np.isfinite(pct) else np.nan,
-            "Post X used (cm)": round(post1_x_used, 3) if np.isfinite(post1_x_used) else np.nan,
-            "Post @ (X-1.0) (g)": round(post1_val, 3) if np.isfinite(post1_val) else np.nan,
-            "Δ Peak - Post@1cm (g)": round(delta, 3) if np.isfinite(delta) else np.nan,
-        })
-
-    return rows
-
-# -----------------------------
-# DUR utilities (unchanged)
-# -----------------------------
-def _max_abs_with_pos(x, y):
-    arr_y = np.asarray(y, dtype=float)
-    arr_x = np.asarray(x, dtype=float)
-    if arr_y.size == 0 or arr_x.size == 0:
-        return (np.nan, np.nan, np.nan, np.nan)
-    idx_abs = int(np.nanargmax(np.abs(arr_y)))
-    max_abs = float(np.abs(arr_y[idx_abs]))
-    x_at_abs = float(arr_x[idx_abs])
-    pos_mask = arr_y > 0
-    if not np.any(pos_mask):
-        return (max_abs, x_at_abs, np.nan, np.nan)
-    idx_pos = int(np.nanargmax(np.where(pos_mask, arr_y, -np.inf)))
-    max_pos = float(arr_y[idx_pos])
-    x_at_pos = float(arr_x[idx_pos])
-    return (max_abs, x_at_abs, max_pos, x_at_pos)
-
-def analyze_dur_first_last(runs, file_name):
-    if len(runs) == 0:
-        return []
-    runs_sorted = sorted(runs, key=lambda t: t[0])
-    _, x1, y1 = runs_sorted[0]
-    _, xL, yL = runs_sorted[-1]
-    max_abs1, x_abs1, _, _ = _max_abs_with_pos(x1, y1)
-    max_absL, x_absL, _, _ = _max_abs_with_pos(xL, yL)
-    return [{
-        "File": file_name,
-        "First Cycle Max |Force| (g)": round(max_abs1, 3) if np.isfinite(max_abs1) else np.nan,
-        "First Cycle Position (cm)": round(x_abs1, 3) if np.isfinite(x_abs1) else np.nan,
-        "Last Cycle Max |Force| (g)": round(max_absL, 3) if np.isfinite(max_absL) else np.nan,
-        "Last Cycle Position (cm)": round(x_absL, 3) if np.isfinite(x_absL) else np.nan,
-    }]
-
-def dur_cycle_tables(runs, file_name):
-    rows_mag = []
-    rows_pos = []
-    for cycle_label, x, y in sorted(runs, key=lambda t: t[0]):
-        max_abs, x_abs, max_pos, x_pos = _max_abs_with_pos(x, y)
-        rows_mag.append({
-            "File": file_name,
-            "Cycle": int(cycle_label),
-            "Max |Force| (g)": max_abs if np.isfinite(max_abs) else np.nan,
-            "Position (cm)": x_abs if np.isfinite(x_abs) else np.nan,
-        })
-        rows_pos.append({
-            "File": file_name,
-            "Cycle": int(cycle_label),
-            "Peak Force (g)": max_pos if np.isfinite(max_pos) else np.nan,
-            "Position (cm)": x_pos if np.isfinite(x_pos) else np.nan,
-        })
-    return pd.DataFrame(rows_mag), pd.DataFrame(rows_pos)
-
-# -----------------------------
-# Streamlit App
-# -----------------------------
-st.set_page_config(page_title="CSV Overlay Plotter", layout="wide")
-st.title("CSV Overlay Plotter")
-uploaded = st.file_uploader("Select CSV files", type="csv", accept_multiple_files=True)
-
-with st.expander("How to use this tool", expanded=not bool(uploaded)):
+with st.expander("How to use", expanded=not uploaded):
     st.markdown(
-        "- Upload one or more CSV files.\n"
-        "- Expected fields include a force column containing `prox` and a position column containing `encoder` or `motor`.\n"
-        "- Files are auto-labeled SF/DUR from filename; unknown files can be manually assigned."
+        "- Upload any mix of Static Friction, Lubricity and Durability CSV exports.\n"
+        "- Test type is read from the **Recipe** line in each file (filename is the fallback).\n"
+        "- Lot and sample are read from the filename (`ln 999524 S#6`).\n"
+        "- **SF breakaways** are located from the tester's `Step` column: each restart after a dwell "
+        "gives the peak within 1 cm of travel, the dwell force, the steady force 1–3 cm after, and Peak − Steady.\n"
+        "- **Footer Check** compares the computed max/min to the tester's own footer values.\n"
+        "- Download the Excel workbook and HTML report at the bottom."
     )
 
-if uploaded:
-    colors = generate_n_colors(len(uploaded))
-    line_styles = ["solid", "dash", "dot", "dashdot"]
-    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+if not uploaded:
+    st.stop()
 
-    # -------------------------------------------------------
-    # IMPROVEMENT #3 & #11: File type detection + manual override
-    # -------------------------------------------------------
-    st.subheader("📋 File Detection Summary")
-    st.caption("Files without 'sf', 'dur', or 'lub' in the name are unrecognized. Use the dropdowns to assign a type manually.")
+parsed, errors = [], []
+for f in uploaded:
+    try:
+        parsed.append((f.name, f.getvalue(), cached_parse(f.name, f.getvalue())))
+    except Exception as e:  # noqa: BLE001
+        errors.append({"File": f.name, "Error": str(e)})
+if errors:
+    st.error("Some files could not be read:")
+    st.dataframe(pd.DataFrame(errors), hide_index=True, use_container_width=True)
 
-    file_type_overrides = {}
-    detection_rows = []
-    for file in uploaded:
-        fname_lower = file.name.lower()
-        if "sf" in fname_lower:
-            auto_type = "SF"
-        elif "lub" in fname_lower:
-            auto_type = "LUB"
-        elif "dur" in fname_lower:
-            auto_type = "DUR"
-        else:
-            auto_type = "Unknown"
-        detection_rows.append({"File": file.name, "Auto-detected": auto_type})
+st.subheader("Files")
+types = {}
+unknown = [p for p in parsed if p[2].test_type == "Unknown"]
+c1, c2 = st.columns([3, 2])
+with c1:
+    st.dataframe(pd.DataFrame([{"File": n, "Lot": tf.lot, "Sample": tf.sample, "Detected": tf.test_type,
+                                "Recipe": tf.meta.get("Recipe", ""), "Warnings": " | ".join(tf.warnings)}
+                               for n, _, tf in parsed]), hide_index=True, use_container_width=True)
+with c2:
+    if unknown:
+        st.markdown("**Assign type for unrecognized files**")
+    for n, _, tf in parsed:
+        types[n] = tf.test_type
+        if tf.test_type == "Unknown":
+            types[n] = st.selectbox(n, ["Unknown", "SF", "LUB", "DUR"], key=f"type_{n}")
 
-    # Show detection table and manual override selectors side by side
-    det_col, override_col = st.columns([2, 2])
-    with det_col:
-        st.dataframe(pd.DataFrame(detection_rows), use_container_width=True, hide_index=True)
-    with override_col:
-        st.markdown("**Manual overrides** (only needed for 'Unknown' files)")
-        for row in detection_rows:
-            if row["Auto-detected"] == "Unknown":
-                chosen = st.selectbox(
-                    f"{row['File']}",
-                    options=["Unknown (skip analysis)", "SF", "DUR", "LUB"],
-                    key=f"override_{row['File']}",
-                )
-                file_type_overrides[row["File"]] = chosen
-            else:
-                file_type_overrides[row["File"]] = row["Auto-detected"]
+payload = tuple((n, raw, types[n]) for n, raw, _ in parsed if types[n] != "Unknown")
+if not payload:
+    st.warning("No files with a recognized test type.")
+    st.stop()
 
-    unknown_count = sum(v == "Unknown (skip analysis)" for v in file_type_overrides.values())
-    if unknown_count:
-        st.warning(f"{unknown_count} file(s) will be skipped unless you assign SF, DUR, or LUB.")
+files, tables = cached_analyze(payload)
+labels = {f.name: f"ln {f.lot} S#{f.sample}" for f in files}
 
-    known_files = [
-        f.name for f in uploaded
-        if file_type_overrides.get(f.name) in ("DUR", "LUB", "SF")
-    ]
-    selected_overlay_files = st.multiselect(
-        "Overlay visibility: choose files to plot",
-        options=known_files,
-        default=known_files,
-    )
+# ------------------------------------------------------------------
+# Results
+# ------------------------------------------------------------------
+st.divider()
+t_sum, t_sf, t_lub, t_dur, t_plot, t_info = st.tabs(
+    ["Max Force Summary", "Static Friction", "Lubricity", "Durability", "Overlay Plots", "File Info"])
 
-    st.divider()
+with t_sum:
+    st.markdown("Overall max push and max pull for every file, all test types.")
+    summ = tables["Max Force Summary"]
+    show(summ)
+    if not summ.empty and (summ["Footer Check"] != "OK").any():
+        st.warning("One or more files do not match the tester footer max/min - check the File Info tab.")
 
-    # -------------------------------------------------------
-    # Main processing loop
-    # -------------------------------------------------------
-    fig = go.Figure()
-    sf_rows_precise = []
-    dur_first_last_rows = []
-    dur_cycle_mag_tables = {}
-    dur_cycle_pos_tables = {}
-    color_map = {}
-    overlay_trace_types = []
-    file_status = []
-    progress = st.progress(0.0, text="Preparing analysis...")
-    status_box = st.empty()
+with t_sf:
+    sf = tables["SF Breakaway"]
+    show(sf)
+    if not sf.empty:
+        st.plotly_chart(plots.sf_breakaway_bar(sf), use_container_width=True)
 
-    for idx, file in enumerate(uploaded):
-        try:
-            df = read_csv_with_flexible_header(StringIO(file.getvalue().decode("utf-8-sig")))
-            if df is None or df.empty:
-                file_status.append({"File": file.name, "Status": "Skipped", "Details": "Could not find expected header row with prox + encoder/motor."})
-                continue
+with t_lub:
+    show(tables["LUB"])
 
-            issues = validate_required_columns(df)
-            if issues:
-                file_status.append({"File": file.name, "Status": "Skipped", "Details": "; ".join(issues)})
-                continue
+with t_dur:
+    st.markdown("**First vs last cycle**")
+    show(tables["DUR First-Last"])
+    cyc = tables["DUR Per-Cycle"]
+    if not cyc.empty:
+        sel = st.multiselect("Files to plot", list(labels), default=[f for f in labels if f in set(cyc["File"])],
+                             format_func=lambda n: labels[n], key="dur_sel")
+        st.plotly_chart(plots.dur_trend(cyc[cyc["File"].isin(sel)], labels), use_container_width=True)
+        with st.expander("Per-cycle table"):
+            show(cyc)
 
-            runs = extract_runs_from_df(df)
-            if not runs:
-                file_status.append({"File": file.name, "Status": "Skipped", "Details": "No valid numeric rows after parsing position/force fields."})
-                continue
+with t_plot:
+    present = sorted({f.test_type for f in files})
+    ttype = st.radio("Test type", present, horizontal=True)
+    choices = [f for f in files if f.test_type == ttype]
+    sel = st.multiselect("Files", [f.name for f in choices], default=[f.name for f in choices],
+                         format_func=lambda n: labels.get(n, n), key="ov_sel")
+    st.plotly_chart(plots.overlay([f for f in choices if f.name in sel], f"{ttype} Force vs Position"),
+                    use_container_width=True)
 
-            base = colors[idx]
-            color_map[file.name] = base
-            dash = line_styles[idx % len(line_styles)]
-            eff_type = file_type_overrides.get(file.name, "Unknown (skip analysis)")
-            if eff_type not in ("DUR", "LUB", "SF"):
-                file_status.append({"File": file.name, "Status": "Skipped", "Details": "Type is Unknown (skip analysis)."})
-                continue
+with t_info:
+    show(tables["File Info"])
 
-            # Overlay plot (no forced y=0)
-            if file.name in selected_overlay_files and len(runs) > 1:
-                for i, (cycle_label, x, y) in enumerate(runs):
-                    alpha = 0.1 + 0.9 * i / (len(runs) - 1) if len(runs) > 1 else 1.0
-                    rgba = f"rgba({base[0]},{base[1]},{base[2]},{alpha})"
-                    show = (i == len(runs) - 1)
-                    name = file.name if show else None
-                    fig.add_trace(
-                        go.Scatter(
-                            x=x, y=y, mode="lines",
-                            line=dict(color=rgba, dash=dash),
-                            name=name, showlegend=show,
-                            legendgroup=file.name,
-                        )
-                    )
-                    overlay_trace_types.append(eff_type)
-            elif file.name in selected_overlay_files:
-                _, x, y = runs[0]
-                rgba = f"rgba({base[0]},{base[1]},{base[2]},1)"
-                fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=rgba, dash=dash), name=file.name, legendgroup=file.name))
-                overlay_trace_types.append(eff_type)
-
-            # --- SF processing ---
-            if eff_type == "SF":
-                _, x_sf, y_sf = runs[-1]
-                rows = analyze_sf_precise(x_sf, y_sf, file.name)
-                sf_rows_precise.extend(rows)
-
-            # --- DUR/LUB processing ---
-            if eff_type == "DUR":
-                dur_first_last_rows.extend(analyze_dur_first_last(runs, file.name))
-
-            if eff_type in ("DUR", "LUB"):
-                df_mag, df_pos = dur_cycle_tables(runs, file_name=file.name)
-                dur_cycle_mag_tables[file.name] = df_mag
-                dur_cycle_pos_tables[file.name] = df_pos
-
-            file_status.append({"File": file.name, "Status": "Processed", "Details": f"Type={eff_type}; runs={len(runs)}"})
-
-        except Exception as e:
-            st.error(f"Error in file {file.name}: {e}")
-            file_status.append({"File": file.name, "Status": "Error", "Details": str(e)})
-        finally:
-            progress_value = (idx + 1) / len(uploaded)
-            progress.progress(progress_value, text=f"Processed {idx + 1}/{len(uploaded)} file(s)")
-            status_box.dataframe(pd.DataFrame(file_status), use_container_width=True, hide_index=True)
-
-    # Overlay figure
-    if overlay_trace_types:
-        visible_all = [True] * len(overlay_trace_types)
-        visible_sf = [t == "SF" for t in overlay_trace_types]
-        visible_dur = [t == "DUR" for t in overlay_trace_types]
-        visible_lub = [t == "LUB" for t in overlay_trace_types]
-        visible_dur_lub = [t in ("DUR", "LUB") for t in overlay_trace_types]
-
-        fig.update_layout(
-            updatemenus=[
-                dict(
-                    type="buttons",
-                    direction="right",
-                    x=0.0,
-                    y=1.18,
-                    xanchor="left",
-                    yanchor="top",
-                    showactive=True,
-                    buttons=[
-                        dict(label="All", method="update", args=[{"visible": visible_all}]),
-                        dict(label="SF only", method="update", args=[{"visible": visible_sf}]),
-                        dict(label="DUR only", method="update", args=[{"visible": visible_dur}]),
-                        dict(label="LUB only", method="update", args=[{"visible": visible_lub}]),
-                        dict(label="DUR + LUB", method="update", args=[{"visible": visible_dur_lub}]),
-                    ],
-                )
-            ],
-            annotations=[
-                dict(
-                    text="Quick filter:",
-                    x=0,
-                    y=1.2,
-                    xref="paper",
-                    yref="paper",
-                    showarrow=False,
-                    xanchor="left",
-                    font=dict(size=12),
-                )
-            ],
-        )
-
-    fig.update_layout(
-        template="plotly_white",
-        xaxis_title="Encoder/Motor (cm)",
-        yaxis_title="Force (g)",
-        title="Overlay Plot",
-        height=650,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- SF output (precise rules) ---
-    if sf_rows_precise:
-        st.subheader("SF Pause → 1 cm Peak (precise rules)")
-        df_sf = pd.DataFrame(sf_rows_precise)[essential_sf_cols].sort_values(["Pause #", "File"])
-        st.dataframe(df_sf, use_container_width=True)
-
-        # IMPROVEMENT #10: Bar chart comparing Pre vs Peak across all SF files
-        st.markdown("**SF Pre vs Peak comparison across files**")
-        sf_files = sorted(df_sf["File"].dropna().unique().tolist())
-        sf_selected_files = st.multiselect("Select SF files to compare", sf_files, default=sf_files)
-        fig_sf_bar = go.Figure()
-        for pnum in sorted(df_sf["Pause #"].dropna().unique()):
-            sub = df_sf[(df_sf["Pause #"] == pnum) & (df_sf["File"].isin(sf_selected_files))]
-            fig_sf_bar.add_trace(go.Bar(
-                name=f"Pause #{int(pnum)} — Pre",
-                x=sub["File"],
-                y=sub["Pre @ X±0.1 (g)"].abs(),
-                marker_color="steelblue",
-                offsetgroup=int(pnum),
-                legendgroup=f"p{int(pnum)}_pre",
-                hovertemplate="<b>%{x}</b><br>Pre: %{y:.3f} g<extra></extra>",
-            ))
-            fig_sf_bar.add_trace(go.Bar(
-                name=f"Pause #{int(pnum)} — Peak",
-                x=sub["File"],
-                y=sub["Peak ≤1cm After (g)"].abs(),
-                marker_color="tomato",
-                offsetgroup=int(pnum) + 0.4,
-                legendgroup=f"p{int(pnum)}_peak",
-                hovertemplate="<b>%{x}</b><br>Peak: %{y:.3f} g<extra></extra>",
-            ))
-        fig_sf_bar.update_layout(
-            template="plotly_white",
-            barmode="group",
-            xaxis_title="File",
-            yaxis_title="|Force| (g)",
-            title="SF Pre vs Peak Force by File & Pause",
-            height=420,
-            legend=dict(orientation="h", y=-0.25),
-        )
-        st.plotly_chart(fig_sf_bar, use_container_width=True)
-
-        st.download_button(
-            "Download SF pause→1 cm peaks (CSV)",
-            data=df_sf.to_csv(index=False).encode("utf-8"),
-            file_name=f"sf_pause_1cm_peaks_precise_{run_stamp}.csv",
-            mime="text/csv",
-        )
-
-    # --- DUR/LUB outputs ---
-    if dur_first_last_rows:
-        st.subheader("DUR First/Last Cycle (Max |Force|)")
-        df_dur = pd.DataFrame(dur_first_last_rows)
-
-        # IMPROVEMENT #9: Add % change first → last
-        def _pct_change(row):
-            f = row.get("First Cycle Max |Force| (g)")
-            l = row.get("Last Cycle Max |Force| (g)")
-            if pd.notna(f) and pd.notna(l) and abs(f) >= 1e-12:
-                return round((l - f) / abs(f) * 100.0, 2)
-            return np.nan
-
-        df_dur["% Change (First→Last)"] = df_dur.apply(_pct_change, axis=1)
-        df_dur = df_dur.sort_values("% Change (First→Last)", ascending=False)
-        st.dataframe(
-            df_dur,
-            use_container_width=True,
-            column_config={
-                "% Change (First→Last)": st.column_config.NumberColumn(
-                    "% Change (First→Last)",
-                    format="%.2f%%",
-                    help="Percent change in max |force| from first to last cycle.",
-                )
-            },
-        )
-        st.download_button(
-            "Download DUR first/last summary (CSV)",
-            data=df_dur.to_csv(index=False).encode("utf-8"),
-            file_name=f"dur_first_last_max_magnitude_{run_stamp}.csv",
-            mime="text/csv",
-        )
-
-    if dur_cycle_mag_tables:
-        combined_mag = pd.concat([v for v in dur_cycle_mag_tables.values()], ignore_index=True)
-        st.download_button(
-            "Download per-cycle Max |Force| (CSV)",
-            data=combined_mag.to_csv(index=False).encode("utf-8"),
-            file_name=f"dur_per_cycle_max_magnitude_{run_stamp}.csv",
-            mime="text/csv",
-        )
-
-    if dur_cycle_pos_tables:
-        st.subheader("DUR/LUB Per-Cycle Peak Force Plot (positive only)")
-        all_files = list(dur_cycle_pos_tables.keys())
-        selected = st.multiselect("Select DUR/LUB files to compare", all_files, default=all_files)
-        fig2 = go.Figure()
-        for name in selected:
-            dfc = dur_cycle_pos_tables[name].copy()
-            dfc['Cycle'] = pd.to_numeric(dfc['Cycle'], errors='coerce')
-            dfc = dfc.sort_values('Cycle')
-            r, g, b = color_map.get(name, (50, 50, 50))
-            fig2.add_trace(
-                go.Scatter(
-                    x=dfc['Cycle'],
-                    y=dfc['Peak Force (g)'],
-                    mode="lines+markers",
-                    name=name,
-                    line=dict(color=f"rgba({r},{g},{b},1)"),
-                    marker=dict(color=f"rgba({r},{g},{b},1)", symbol="diamond"),
-                )
-            )
-        fig2.update_layout(
-            template="plotly_white",
-            xaxis_title="Cycle",
-            yaxis_title="Peak Force (g)",
-            title="Per-Cycle Peak Force (positive only)",
-            yaxis=dict(range=[0, None], zeroline=True, zerolinewidth=1),
-            height=500,
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-        combined_pos = pd.concat([v for v in dur_cycle_pos_tables.values()], ignore_index=True)
-        st.download_button(
-            "Download per-cycle Peak Force (CSV)",
-            data=combined_pos.to_csv(index=False).encode("utf-8"),
-            file_name=f"dur_per_cycle_peak_force_{run_stamp}.csv",
-            mime="text/csv",
-        )
+# ------------------------------------------------------------------
+# Downloads
+# ------------------------------------------------------------------
+st.divider()
+st.subheader("Downloads")
+xlsx, html_bytes = cached_exports(payload)
+stamp = datetime.now().strftime("%Y%m%d_%H%M")
+d1, d2 = st.columns(2)
+d1.download_button("Excel workbook (all tables)", xlsx, f"advpb_analysis_{stamp}.xlsx",
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+d2.download_button("HTML report (tables + plots)", html_bytes, f"advpb_report_{stamp}.html",
+                   "text/html", use_container_width=True)
